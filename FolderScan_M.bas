@@ -1,19 +1,23 @@
 Attribute VB_Name = "FolderScan_M"
 Option Explicit
 
+Private visited As Object  ' used by RecursiveFolderScan guard
+
 Public Sub FolderScan()
+    Const DO_SORT As Boolean = True
+    Const DO_HYPERLINKS As Boolean = False
+    Const DO_PAINT_MISSING As Boolean = True
+    Const DO_REFRESH_ALL As Boolean = True
+    Const DO_UPDATE_KW As Boolean = True
+
     Dim ws As Worksheet
     Dim loConfig As ListObject, loFiles As ListObject
     Dim found As Range
     Dim aLocalRoot As String, domainName As String, htmlFilePath As String
     Dim urlPrefix As String, urlSuffix As String
 
-    Dim r As ListRow
-    Dim existingRows As Object          ' Scripting.Dictionary: RelPath -> ListRow
-    Dim existingFolderSet As Object     ' Scripting.Dictionary: folder RelPath -> True
-    Dim showSettings As Object          ' Scripting.Dictionary: folder RelPath -> explicit rule (from Excel)
-    Dim allDescs As Collection
-    Dim desc As FileDescriptor
+    Dim r As ListRow, rowToUpdate As ListRow
+    Dim allDescs As Collection, desc As FileDescriptor
 
     Dim objType As String, showVal As String
     Dim cellVal As Variant
@@ -21,48 +25,49 @@ Public Sub FolderScan()
 
     Dim colNumber As Long, colDateFound As Long, colKeywords As Long
     Dim colDomain As Long, colCategory As Long, colFolder As Long
-    Dim colObjType As Long, colFileName As Long, colObjName As Long
+    Dim colObjType As Long
+    Dim colFileName As Long                  ' <-- now points to "Object name"
     Dim colRelPath As Long, colShow As Long, colLink As Long
 
-    Dim rel As Variant, relKey As String
-    Dim skip As Boolean
-    Dim parts() As String, n As Long
-    Dim isFolderObj As Boolean
-
-    Dim allowed As Object               ' Scripting.Dictionary: RelPath -> FileDescriptor (after Show? rules)
-    Dim presentSet As Object            ' Scripting.Dictionary: RelPath -> True (snapshot of all *present* keys this run)
-    Dim baseNewSet As Object            ' Scripting.Dictionary: new folder RelPath -> True
-    Dim showDefaults As Object          ' Scripting.Dictionary: RelPath -> default "1st Level"/"Nothing"
-    Dim keysArr As Variant, kKey As Variant, childKey As Variant
-    Dim toRemove As Collection
-    Dim parentPath As String, p As Long, diff As Long
-
-    Dim remainingNew As Object
-    Dim newKeys As Variant, numRows As Long, numCols As Long
-    Dim batchData() As Variant, i As Long
-    Dim startRow As Long, targetRange As Range
-    Dim rowToUpdate As ListRow, c As Range
-
+    Dim parts() As String, n As Long, isFolderObj As Boolean
     Dim fullPath As String, t As String
-    Dim rp As String
-    Dim effRule As String, effRulePath As String
-    Dim tmpPath As String
 
-    ' Numbering helpers (no color-based logic)
+    ' repositories / sets
+    Dim existingRows As Object
+    Dim existingRelSet As Object
+    Dim existingFolderSet As Object
+    Dim showSettings As Object
+
+    Dim allowed As Object
+    Dim fsRelSet As Object
+
+    Dim toKeep As Object
+    Dim toAdd As Object
+    Dim toMissing As Object
+
+    Dim baseNewSet As Object
+    Dim showDefaults As Object
+
+    Dim keysArr As Variant, kKey As Variant, childKey As Variant
+    Dim parentPath As String, p As Long, diff As Long
+    Dim rp As String, effRule As String, effRulePath As String, tmpPath As String
+
     Dim blankNumberCells As Collection
+    Dim newKeys As Variant
+    Dim numRows As Long, numCols As Long, i As Long
+    Dim batchData() As Variant, startRow As Long, targetRange As Range, c As Range
 
-    ' Link build vars (used only for NEW rows)
     Dim encRel As String, computedLink As String, isShortcut As Boolean
 
-    ' New rows fill color (Light Blue)
     Const NEWROW_COLOR As Long = &HF7EBDD   ' RGB(221,235,247)
 
     On Error GoTo CleanFail
+    Application.EnableCancelKey = xlErrorHandler
     Application.ScreenUpdating = False
     Application.Calculation = xlCalculationManual
     Application.EnableEvents = False
 
-    '— 1) tbConfig: Local Root, Domain name, Url Prefix / Suffix —
+    '— 1) tbConfig —
     For Each ws In ActiveWorkbook.Worksheets
         On Error Resume Next
         Set loConfig = ws.ListObjects("tbConfig")
@@ -101,7 +106,7 @@ Public Sub FolderScan()
         urlSuffix = ""
     End If
 
-    '— 2) Locate tbFiles —
+    '— 2) tbFiles —  [Lap "Bind columns; 'Object name' is the single name column"]
     For Each ws In ActiveWorkbook.Worksheets
         On Error Resume Next
         Set loFiles = ws.ListObjects("tbFiles")
@@ -110,7 +115,6 @@ Public Sub FolderScan()
     Next ws
     If loFiles Is Nothing Then MsgBox "Output table 'tbFiles' not found.", vbCritical: GoTo CleanFail
 
-    ' Cache column indexes
     colNumber = loFiles.ListColumns("#").Index
     colDateFound = loFiles.ListColumns("Date found").Index
     colKeywords = loFiles.ListColumns("Keywords").Index
@@ -118,13 +122,12 @@ Public Sub FolderScan()
     colCategory = loFiles.ListColumns("Category").Index
     colFolder = loFiles.ListColumns("Folder").Index
     colObjType = loFiles.ListColumns("Object Type").Index
-    colFileName = loFiles.ListColumns("Filename").Index
-    colObjName = loFiles.ListColumns("Object name").Index
+    colFileName = loFiles.ListColumns("Object name").Index   ' <-- renamed target column
     colRelPath = loFiles.ListColumns("RelativePath").Index
     colLink = IIf(ColumnExists(loFiles, "Link"), loFiles.ListColumns("Link").Index, 0)
     colShow = IIf(ColumnExists(loFiles, "Show?"), loFiles.ListColumns("Show?").Index, 0)
 
-    ' === 2b) Pre-scan reset of visuals (entire table body) ===
+    ' Clear visuals up-front  [Lap "Ensure neutral canvas before this run"]
     If Not loFiles.DataBodyRange Is Nothing Then
         With loFiles.DataBodyRange
             .FormatConditions.Delete
@@ -133,10 +136,11 @@ Public Sub FolderScan()
             .Interior.ColorIndex = xlColorIndexNone
         End With
     End If
-    ' ==========================================================
 
-    '— 3) Snapshot existing rows (no color logic) & numbering info —
+    '— 3) Snapshot Excel repository —  [Lap "Existing rows, Show? rules, numbering"]
+    Dim relKey As String
     Set existingRows = CreateObject("Scripting.Dictionary")
+    Set existingRelSet = CreateObject("Scripting.Dictionary")
     Set existingFolderSet = CreateObject("Scripting.Dictionary")
     Set showSettings = CreateObject("Scripting.Dictionary")
     Set blankNumberCells = New Collection
@@ -147,6 +151,7 @@ Public Sub FolderScan()
             relKey = CStr(r.Range.Cells(1, colRelPath).Value)
             If existingRows.Exists(relKey) Then existingRows.Remove relKey
             existingRows.Add relKey, r
+            If Not existingRelSet.Exists(relKey) Then existingRelSet.Add relKey, True
 
             objType = CStr(r.Range.Cells(1, colObjType).Value)
             If objType = "Category" Or objType = "Folder" Or objType = "Subfolder" Then
@@ -154,9 +159,9 @@ Public Sub FolderScan()
             End If
         End If
 
-        ' Collect explicit Show? rules from folders (Excel)
-        objType = CStr(r.Range.Cells(1, colObjType).Value)
-        If objType = "Category" Or objType = "Folder" Or objType = "Subfolder" Then
+        If CStr(r.Range.Cells(1, colObjType).Value) = "Category" Or _
+           CStr(r.Range.Cells(1, colObjType).Value) = "Folder" Or _
+           CStr(r.Range.Cells(1, colObjType).Value) = "Subfolder" Then
             If colShow > 0 Then
                 showVal = LCase$(Trim$(CStr(r.Range.Cells(1, colShow).Value)))
                 If Len(showVal) > 0 Then
@@ -166,7 +171,6 @@ Public Sub FolderScan()
             End If
         End If
 
-        ' Numbering (no color filtering)
         cellVal = r.Range.Cells(1, colNumber).Value
         If Len(Trim$(CStr(cellVal))) = 0 Then
             blankNumberCells.Add r.Range.Cells(1, colNumber)
@@ -176,11 +180,12 @@ Public Sub FolderScan()
     Next r
     nextNum = maxNum + 1
 
-    '— 4) Scan filesystem —
+    '— 4) Scan filesystem —  [Lap "Collect descriptors from disk"]
     Set allDescs = New Collection
     ScanFoldersCollectDescriptors aLocalRoot, allDescs
 
-    '— 4b) Map fields; relabel folders; restore shortcut link extraction —
+    '— 4b) Map / shortcuts —  [Lap "Normalize types; preserve case for (.url/.lnk) parenthesis tag"]
+    Dim isUrl As Boolean, isLnk As Boolean
     For Each desc In allDescs
         desc.Domain = domainName
 
@@ -191,7 +196,6 @@ Public Sub FolderScan()
         If isFolderObj Then
             If n >= 0 Then desc.Category = parts(0) Else desc.Category = ""
             If n >= 1 Then desc.Folder = parts(1) Else desc.Folder = ""
-
             Select Case n
                 Case 0: desc.ObjectType = "Category"
                 Case 1: desc.ObjectType = "Folder"
@@ -201,12 +205,16 @@ Public Sub FolderScan()
             If n >= 1 Then desc.Category = parts(0) Else desc.Category = ""
             If n >= 2 Then desc.Folder = parts(1) Else desc.Folder = ""
 
-            If EndsWithCI(desc.fileName, ".lnk") Or EndsWithCI(desc.fileName, ".url") Then
+            isUrl = EndsWithCI(desc.fileName, ".url")
+            isLnk = EndsWithCI(desc.fileName, ".lnk")
+
+            If isUrl Or isLnk Then
                 fullPath = aLocalRoot & desc.RelativePath
-                desc.Link = ResolveShortcutLink(fullPath)   ' may be ""
+                desc.Link = ResolveShortcutLink(fullPath)
+
                 t = DeriveShortcutTypeFromName(desc.fileName)
                 If Len(t) > 0 Then
-                    desc.ObjectType = LCase$(t)
+                    desc.ObjectType = t      ' preserve case
                 Else
                     desc.ObjectType = "shortcut"
                 End If
@@ -214,33 +222,30 @@ Public Sub FolderScan()
         End If
     Next desc
 
-    '— 5) Apply Show? rules (inner-level override) —
+    '— 5) Apply Show? rules —  [Lap "Inner-most rule wins; guard against path-walk loops"]
     Set allowed = CreateObject("Scripting.Dictionary")
+    Dim guard As Long
     For Each desc In allDescs
         rp = desc.RelativePath
-        effRule = ""
-        effRulePath = ""
-
-        tmpPath = rp
+        effRule = "": effRulePath = "": tmpPath = rp
+        guard = 0
         Do While Len(tmpPath) > 0
+            guard = guard + 1
+            If guard > 200 Then Err.Raise vbObjectError + 911, , "Guard tripped in Show?-walk: " & tmpPath
+
             If showSettings.Exists(tmpPath) Then
                 effRule = CStr(showSettings(tmpPath))
                 effRulePath = tmpPath
                 Exit Do
             End If
             p = InStrRev(tmpPath, "\")
-            If p > 0 Then
-                tmpPath = Left$(tmpPath, p - 1)
-            Else
-                Exit Do
-            End If
+            If p > 0 Then tmpPath = Left$(tmpPath, p - 1) Else Exit Do
         Loop
 
-        skip = False
+        Dim skip As Boolean: skip = False
         If Len(effRule) > 0 Then
             Select Case effRule
                 Case "all"
-                    ' keep everything
                 Case "nothing"
                     If LCase$(rp) <> LCase$(effRulePath) Then skip = True
                 Case "subfolders"
@@ -254,115 +259,95 @@ Public Sub FolderScan()
                         diff = UBound(Split(rp, "\")) - UBound(Split(effRulePath, "\")) + 0
                         If diff > 1 Then skip = True
                     End If
-                Case Else
-                    ' treat unknown as "all"
             End Select
         End If
 
         If Not skip Then
-            relKey = CStr(desc.RelativePath)
-            If allowed.Exists(relKey) Then allowed.Remove relKey
-            allowed.Add relKey, desc
+            If allowed.Exists(rp) Then allowed.Remove rp
+            allowed.Add rp, desc
         End If
+        If (allowed.Count Mod 200) = 0 Then DoEvents
     Next desc
 
-    ' === Snapshot “present” set for yellow painting later ===
-    Set presentSet = CreateObject("Scripting.Dictionary")
-    For Each rel In allowed.keys
-        presentSet.Add CStr(rel), True
-    Next rel
-    ' =======================================================
+    '— sets: Excel vs FS —  [Lap "Partition into Keep / Add / Missing"]
+    Set fsRelSet = CreateObject("Scripting.Dictionary")
+    Dim kRel As Variant
+    For Each kRel In allowed.keys
+        fsRelSet.Add CStr(kRel), True
+    Next kRel
 
-    '— 6) New-folder defaults based on parent explicit rule —
+    Set toKeep = CreateObject("Scripting.Dictionary")
+    Set toAdd = CreateObject("Scripting.Dictionary")
+    Set toMissing = CreateObject("Scripting.Dictionary")
+
+    For Each kRel In existingRelSet.keys
+        If fsRelSet.Exists(CStr(kRel)) Then
+            toKeep.Add CStr(kRel), True
+        Else
+            toMissing.Add CStr(kRel), True
+        End If
+    Next kRel
+    For Each kRel In fsRelSet.keys
+        If Not existingRelSet.Exists(CStr(kRel)) Then
+            toAdd.Add CStr(kRel), True
+        End If
+    Next kRel
+
+    '— defaults for new base folders —  [Lap "Pre-fill Show? on first-time folders"]
     Set baseNewSet = CreateObject("Scripting.Dictionary")
     Set showDefaults = CreateObject("Scripting.Dictionary")
-
     keysArr = allowed.keys
 
-    ' 6a) Identify base new folders
-    For Each kKey In keysArr
-        relKey = CStr(kKey)
-        Set desc = allowed(relKey)
+    For Each kRel In keysArr
+        rp = CStr(kRel)
+        Set desc = allowed(rp)
         If desc.ObjectType = "Category" Or desc.ObjectType = "Folder" Or desc.ObjectType = "Subfolder" Then
-            If Not existingRows.Exists(relKey) Then
-                p = InStrRev(relKey, "\")
-                If p > 0 Then
-                    parentPath = Left$(relKey, p - 1)
-                Else
-                    parentPath = ""
-                End If
-                If (parentPath = "" Or existingFolderSet.Exists(parentPath)) Then
-                    If Not baseNewSet.Exists(relKey) Then baseNewSet.Add relKey, True
+            If Not existingRelSet.Exists(rp) Then
+                p = InStrRev(rp, "\")
+                If p > 0 Then parentPath = Left$(rp, p - 1) Else parentPath = ""
+                If parentPath = "" Or existingFolderSet.Exists(parentPath) Then
+                    If Not baseNewSet.Exists(rp) Then baseNewSet.Add rp, True
                 End If
             End If
         End If
-    Next kKey
+    Next kRel
 
-    ' 6b) Assign default Show? for each base new folder; trim deeper descendants
-    Set toRemove = New Collection
-    For Each kKey In baseNewSet.keys
-        relKey = CStr(kKey)
+    For Each kRel In baseNewSet.keys
+        rp = CStr(kRel)
+        p = InStrRev(rp, "\")
+        If p > 0 Then parentPath = Left$(rp, p - 1) Else parentPath = ""
 
-        p = InStrRev(relKey, "\")
-        If p > 0 Then
-            parentPath = Left$(relKey, p - 1)
-        Else
-            parentPath = ""
-        End If
-
-        Dim parentRule As String
-        parentRule = ""
+        Dim parentRule As String: parentRule = ""
         If Len(parentPath) > 0 Then
-            If showSettings.Exists(parentPath) Then
-                parentRule = LCase$(CStr(showSettings(parentPath)))
-            End If
+            If showSettings.Exists(parentPath) Then parentRule = LCase$(CStr(showSettings(parentPath)))
         End If
 
         If parentRule = "1st level" Then
-            If Not showDefaults.Exists(relKey) Then showDefaults.Add relKey, "Nothing"
+            If Not showDefaults.Exists(rp) Then showDefaults.Add rp, "Nothing"
         Else
-            If Not showDefaults.Exists(relKey) Then showDefaults.Add relKey, "1st Level"
+            If Not showDefaults.Exists(rp) Then showDefaults.Add rp, "1st Level"
         End If
+    Next kRel
 
-        For Each childKey In keysArr
-            rp = CStr(childKey)
-            If LCase$(Left$(rp, Len(relKey) + 1)) = LCase$(relKey & "\") Then
-                diff = UBound(Split(rp, "\")) - UBound(Split(relKey, "\")) + 0
-                Set desc = allowed(rp)
-                If diff > 1 Then
-                    toRemove.Add rp
-                End If
-            End If
-        Next childKey
-    Next kKey
-
-    For i = 1 To toRemove.Count
-        If allowed.Exists(toRemove(i)) Then allowed.Remove toRemove(i)
-    Next i
-
-    '— 7) Update existing rows (no Link changes) and remove matched from allowed —
-    For Each rel In existingRows.keys
-        relKey = CStr(rel)
-        If allowed.Exists(relKey) Then
-            Set rowToUpdate = existingRows(relKey)
-            Set desc = allowed(relKey)
+    '— update keep —  [Lap "Refresh metadata on rows that still exist on disk"]
+    For Each kRel In toKeep.keys
+        rp = CStr(kRel)
+        If existingRows.Exists(rp) Then
+            Set rowToUpdate = existingRows(rp)
+            Set desc = allowed(rp)
             With rowToUpdate.Range
                 .Cells(1, colDomain).Value = desc.Domain
                 .Cells(1, colCategory).Value = desc.Category
                 .Cells(1, colFolder).Value = desc.Folder
                 .Cells(1, colObjType).Value = desc.ObjectType
-                .Cells(1, colFileName).Value = desc.fileName
-                .Cells(1, colObjName).Value = desc.ObjectName
+                .Cells(1, colFileName).Value = desc.fileName      ' <-- write to "Object name"
                 .Cells(1, colRelPath).Value = desc.RelativePath
-                ' IMPORTANT: Do NOT modify Link for existing rows
                 .Cells(1, colKeywords).Value = CleanKeywords(.Cells(1, colKeywords).Value)
             End With
-            allowed.Remove relKey
         End If
-    Next rel
+    Next kRel
 
-    ' Fill blank "#" in existing rows before adding new
-    Set blankNumberCells = blankNumberCells ' (already filled list)
+    ' numbering fill  [Lap "Assign new IDs to blanks, keep monotonic growth"]
     If blankNumberCells.Count > 0 Then
         For Each c In blankNumberCells
             If Len(Trim$(CStr(c.Value))) = 0 Then
@@ -372,29 +357,23 @@ Public Sub FolderScan()
         Next c
     End If
 
-    '— 8) Add NEW rows in batch, then paint them Light Blue —
-    Set remainingNew = CreateObject("Scripting.Dictionary")
-    For Each rel In allowed.keys
-        remainingNew.Add CStr(rel), allowed(rel)
-    Next rel
+    '— add new in batch & paint blue —  [Lap "Append new rows and highlight"]
+    If toAdd.Count > 0 Then
+        newKeys = toAdd.keys
+        If Not IsEmpty(newKeys) Then
+            If UBound(newKeys) > LBound(newKeys) Then QuickSortArray newKeys, LBound(newKeys), UBound(newKeys)
+        End If
 
-    newKeys = remainingNew.keys
-    If Not IsEmpty(newKeys) Then
-        If UBound(newKeys) > LBound(newKeys) Then QuickSortArray newKeys, LBound(newKeys), UBound(newKeys)
-    End If
-
-    If remainingNew.Count > 0 Then
-        numRows = remainingNew.Count
+        numRows = toAdd.Count
         numCols = loFiles.ListColumns.Count
         ReDim batchData(1 To numRows, 1 To numCols)
 
         i = 1
-        For Each rel In newKeys
-            relKey = CStr(rel)
-            Set desc = remainingNew(relKey)
+        For Each kRel In newKeys
+            rp = CStr(kRel)
+            Set desc = allowed(rp)
 
             isShortcut = EndsWithCI(desc.fileName, ".lnk") Or EndsWithCI(desc.fileName, ".url")
-
             If isShortcut Then
                 computedLink = Trim$(desc.Link)
             Else
@@ -421,8 +400,7 @@ Public Sub FolderScan()
             batchData(i, colCategory) = desc.Category
             batchData(i, colFolder) = desc.Folder
             batchData(i, colObjType) = desc.ObjectType
-            batchData(i, colFileName) = desc.fileName
-            batchData(i, colObjName) = desc.ObjectName
+            batchData(i, colFileName) = desc.fileName      ' <-- write to "Object name"
             batchData(i, colRelPath) = desc.RelativePath
             If colLink > 0 Then batchData(i, colLink) = computedLink
             batchData(i, colNumber) = nextNum
@@ -430,8 +408,8 @@ Public Sub FolderScan()
             batchData(i, colKeywords) = ""
 
             If colShow > 0 Then
-                If showDefaults.Exists(relKey) Then
-                    batchData(i, colShow) = showDefaults(relKey)
+                If showDefaults.Exists(rp) Then
+                    batchData(i, colShow) = showDefaults(rp)
                 Else
                     batchData(i, colShow) = ""
                 End If
@@ -439,7 +417,8 @@ Public Sub FolderScan()
 
             nextNum = nextNum + 1
             i = i + 1
-        Next rel
+            If (i Mod 200) = 0 Then DoEvents
+        Next kRel
 
         For i = 1 To numRows
             loFiles.ListRows.Add
@@ -448,11 +427,8 @@ Public Sub FolderScan()
         startRow = loFiles.DataBodyRange.Rows.Count - numRows + 1
         Set targetRange = loFiles.DataBodyRange.Rows(startRow).Resize(numRows, numCols)
         targetRange.Value = batchData
-
-        ' Paint NEW rows Light Blue
         targetRange.Interior.Color = NEWROW_COLOR
 
-        ' Clean keywords for new rows
         If colKeywords > 0 Then
             For Each c In targetRange.Columns(colKeywords).Cells
                 c.Value = CleanKeywords(c.Value)
@@ -460,46 +436,50 @@ Public Sub FolderScan()
         End If
     End If
 
-    '— 9) Make all Link cells clickable —
-    If colLink > 0 And Not loFiles.DataBodyRange Is Nothing Then
-        ApplyHyperlinksOnLinkColumn loFiles, colLink
+    '— links —  [Lap "Optional: make Link column clickable without changing value"]
+    If DO_HYPERLINKS And colLink > 0 And Not loFiles.DataBodyRange Is Nothing Then
+        ApplyHyperlinksOnLinkColumnFast loFiles, colLink
     End If
 
-    '— 10) Sort tbFiles by RelativePath —
-    With loFiles.Sort
-        .SortFields.Clear
-        .SortFields.Add key:=loFiles.ListColumns("RelativePath").DataBodyRange, _
-                        SortOn:=xlSortOnValues, Order:=xlAscending, DataOption:=xlSortNormal
-        .Header = xlYes
-        .Apply
-    End With
+    '— sort —
+    If DO_SORT Then
+        With loFiles.Sort
+            .SortFields.Clear
+            .SortFields.Add key:=loFiles.ListColumns("RelativePath").DataBodyRange, _
+                            SortOn:=xlSortOnValues, Order:=xlAscending, DataOption:=xlSortNormal
+            .Header = xlYes
+            .Apply
+        End With
+    End If
 
-    '— 11) Post-scan: compute and paint MISSING rows (Yellow) ONCE —
-    Dim missRanges As Collection, rngUnion As Range, hl As Range
-    Set missRanges = New Collection
-
-    For Each rel In existingRows.keys
-        relKey = CStr(rel)
-        If Not presentSet.Exists(relKey) Then
-            missRanges.Add existingRows(relKey).Range
-        End If
-    Next rel
-
-    If missRanges.Count > 0 Then
-        For Each hl In missRanges
-            If rngUnion Is Nothing Then
-                Set rngUnion = hl
-            Else
-                Set rngUnion = Application.Union(rngUnion, hl)
+    '— paint missing (Excel \ FS) —  [Lap "Any row not present on disk becomes Yellow"]
+    If DO_PAINT_MISSING Then
+        Dim currentRows As Object: Set currentRows = CreateObject("Scripting.Dictionary")
+        Dim rk As String
+        For Each r In loFiles.ListRows
+            rk = CStr(r.Range.Cells(1, colRelPath).Value)
+            If Len(rk) > 0 Then
+                If currentRows.Exists(rk) Then currentRows.Remove rk
+                currentRows.Add rk, r
             End If
-        Next hl
-        If Not rngUnion Is Nothing Then rngUnion.Interior.Color = vbYellow
+        Next r
+
+        If toMissing.Count > 0 Then
+            Dim missRanges As New Collection, rr As Variant, rngUnion As Range
+            For Each rr In toMissing.keys
+                rk = CStr(rr)
+                If currentRows.Exists(rk) Then missRanges.Add currentRows(rk).Range
+            Next rr
+
+            Set rngUnion = UnionChunked(missRanges, 60)
+            If Not rngUnion Is Nothing Then rngUnion.Interior.Color = vbYellow
+        End If
     End If
 
-    '— 12) Timestamp, keywords, refresh —
+    '— finalize —
     ActiveWorkbook.Worksheets("Cover").Range("cUpdateDate").Value = Date
-    UpdateKeywordsTable
-    ActiveWorkbook.RefreshAll
+    If DO_UPDATE_KW Then UpdateKeywordsTable
+    If DO_REFRESH_ALL Then ActiveWorkbook.RefreshAll
 
     MsgBox "tbFiles synchronized.", vbInformation
 
@@ -510,12 +490,79 @@ CleanUp:
     Exit Sub
 
 CleanFail:
-    Application.EnableEvents = True
-    Application.Calculation = xlCalculationAutomatic
-    Application.ScreenUpdating = True
-    MsgBox "FolderScan failed: " & Err.Description, vbCritical
+    If Err.Number = 18 Then
+        MsgBox "Stopped by user.", vbExclamation
+    Else
+        MsgBox "FolderScan failed: " & Err.Number & " — " & Err.Description, vbCritical
+    End If
+    Resume CleanUp
 End Sub
 
+
+' --- lightweight timing ---
+
+Public Sub Lap(ByVal label As String)
+Static t0 As Double
+    If t0 = 0 Then
+        t0 = Timer
+        'Debug.Print "? start"
+    End If
+    Debug.Print "Time " & Format(Timer - t0, "0.000") & "s — " & label
+End Sub
+
+' Fast, idempotent hyperlinks (NEW)
+Private Sub ApplyHyperlinksOnLinkColumnFast(ByVal lo As ListObject, ByVal colLink As Long)
+    On Error GoTo EH
+    If lo Is Nothing Then Exit Sub
+    If lo.DataBodyRange Is Nothing Then Exit Sub
+    If colLink <= 0 Then Exit Sub
+
+    Dim cell As Range, url As String
+    Application.DisplayAlerts = False
+    For Each cell In lo.DataBodyRange.Columns(colLink).Cells
+        url = CStr(cell.Value)
+        If Len(url) > 0 Then
+            If cell.Hyperlinks.Count = 0 Or cell.Hyperlinks(1).Address <> url Then
+                If cell.Hyperlinks.Count > 0 Then cell.Hyperlinks.Delete
+                cell.Worksheet.Hyperlinks.Add Anchor:=cell, Address:=url, TextToDisplay:=url
+            End If
+        ElseIf cell.Hyperlinks.Count > 0 Then
+            cell.Hyperlinks.Delete
+        End If
+        If (cell.Row Mod 400) = 0 Then DoEvents
+    Next cell
+    Application.DisplayAlerts = True
+    Exit Sub
+EH:
+    Application.DisplayAlerts = True
+End Sub
+
+' Chunk-safe Union to avoid O(n^2) unions (NEW)
+Private Function UnionChunked(ByVal rngs As Collection, Optional ByVal chunkSize As Long = 60) As Range
+    Dim i As Long, j As Long
+    Dim acc As Range, part As Range
+    If rngs Is Nothing Or rngs.Count = 0 Then Exit Function
+
+    For i = 1 To rngs.Count Step chunkSize
+        Set part = Nothing
+        For j = i To Application.Min(i + chunkSize - 1, rngs.Count)
+            If part Is Nothing Then
+                Set part = rngs(j)
+            Else
+                Set part = Application.Union(part, rngs(j))
+            End If
+        Next j
+        If Not part Is Nothing Then
+            If acc Is Nothing Then
+                Set acc = part
+            Else
+                Set acc = Application.Union(acc, part)
+            End If
+        End If
+        DoEvents
+    Next i
+    Set UnionChunked = acc
+End Function
 
 ' === helpers used here ===
 Private Function ColumnExists(lo As ListObject, colName As String) As Boolean
@@ -633,52 +680,233 @@ EH:
     Application.DisplayAlerts = True
 End Sub
 
-Private Function BuildJSONFromTableIgnoreYellow() As String
-    Dim lo As ListObject, ws As Worksheet
-    For Each ws In ActiveWorkbook.Worksheets
+' Build JSON for the given workbook, skipping yellow rows,
+' and emitting: Repository, Location, ObjectName, PrimaryName, ObjectType,
+' Description, Keywords, Reference, DateDoc, Approved, Relevance, Link
+Private Function BuildJSONFromWorkbookIgnoreYellow(ByVal wb As Excel.Workbook) As String
+    Const SMALL_SAMPLE As Boolean = False   ' << set True to emit only first 10 non-yellow rows
+
+    Dim ws As Worksheet
+    Dim lo As ListObject
+    Dim loConfig As ListObject
+    Dim found As Range
+    Dim shortName As String
+
+    Dim json As String, sep As String
+    Dim r As ListRow
+    Dim taken As Long
+
+    ' 1) Find tbFiles in this workbook
+    Set lo = Nothing
+    For Each ws In wb.Worksheets
         On Error Resume Next
         Set lo = ws.ListObjects("tbFiles")
         On Error GoTo 0
         If Not lo Is Nothing Then Exit For
     Next ws
-    If lo Is Nothing Then Err.Raise vbObjectError + 1, , "tbFiles not found"
 
-    If lo.DataBodyRange Is Nothing Then
-        BuildJSONFromTableIgnoreYellow = "[]"
+    If lo Is Nothing Or lo.DataBodyRange Is Nothing Then
+        BuildJSONFromWorkbookIgnoreYellow = "[]"
         Exit Function
     End If
 
-    Dim json As String, sep As String
-    Dim r As ListRow
+    ' 2) Find tbConfig and read Short Name (Repository)
+    Set loConfig = Nothing
+    For Each ws In wb.Worksheets
+        On Error Resume Next
+        Set loConfig = ws.ListObjects("tbConfig")
+        On Error GoTo 0
+        If Not loConfig Is Nothing Then Exit For
+    Next ws
 
-    json = "[": sep = ""
+    If loConfig Is Nothing Then
+        shortName = "..."
+    Else
+        With loConfig.DataBodyRange
+            Set found = .Columns(loConfig.ListColumns("Key").Index) _
+                        .Find(What:="Short Name", LookIn:=xlValues, LookAt:=xlWhole)
+        End With
+
+        If found Is Nothing Then
+            shortName = "..."
+        Else
+            shortName = CStr(found.Offset(0, _
+                loConfig.ListColumns("Value").Index - loConfig.ListColumns("Key").Index).Value)
+            If Len(shortName) = 0 Then shortName = "..."
+        End If
+    End If
+
+    ' 3) Build JSON rows
+    json = "[": sep = "": taken = 0
+
+    Dim hasRel As Boolean, hasObjName As Boolean, hasObjType As Boolean
+    Dim hasDesc As Boolean, hasKw As Boolean, hasRef As Boolean
+    Dim hasDateDoc As Boolean, hasApproved As Boolean, hasLink As Boolean
+    Dim hasRelevance As Boolean
+
+    hasRel = ColumnExists(lo, "RelativePath")
+    hasObjName = ColumnExists(lo, "Object name")
+    hasObjType = ColumnExists(lo, "Object Type")
+    hasDesc = ColumnExists(lo, "Description")
+    hasKw = ColumnExists(lo, "Keywords")
+    hasRef = ColumnExists(lo, "Reference")
+    hasDateDoc = ColumnExists(lo, "Date Doc")
+    hasApproved = ColumnExists(lo, "Approved?")
+    hasLink = ColumnExists(lo, "Link")
+    hasRelevance = ColumnExists(lo, "Relevance")
+
+    Dim relPath As String, location As String
+    Dim objectName As String, primaryName As String
+    Dim objType As String, objTypeOut As String
+    Dim lastSlash As Long, dotPos As Long
+    Dim baseNoExt As String
+    Dim cellHash As Range
+    Dim relvRaw As String, relvOut As String
+
     For Each r In lo.ListRows
-        ' skip yellow rows (missing in filesystem)
-        'If r.Range.Cells(1, lo.ListColumns("#").Index).Value = 78 Then
-        '    Debug.Print "Break here"
-        'End If
-        If r.Range.Cells(1, lo.ListColumns("#").Index).Interior.Color = vbYellow Then
+        ' Skip yellow rows (missing in filesystem) using the "#" cell style
+        Set cellHash = r.Range.Cells(1, lo.ListColumns("#").Index)
+        If cellHash.Interior.Color = vbYellow Then
             ' skip
         Else
-            With r.Range
-                json = json & sep & "{"
-                json = json & """RelativePath"":""" & j(.Cells(1, lo.ListColumns("RelativePath").Index).Value) & ""","
-                json = json & """ObjectType"":""" & j(.Cells(1, lo.ListColumns("Object Type").Index).Value) & ""","
-                json = json & """Description"":""" & j(.Cells(1, lo.ListColumns("Description").Index).Value) & ""","
-                json = json & """Keywords"":""" & j(.Cells(1, lo.ListColumns("Keywords").Index).Value) & ""","
-                json = json & """Reference"":""" & j(.Cells(1, lo.ListColumns("Reference").Index).Value) & ""","
-                json = json & """DateDoc"":""" & j(.Cells(1, lo.ListColumns("Date Doc").Index).Value) & ""","
-                json = json & """Approved"":""" & j(.Cells(1, lo.ListColumns("Approved?").Index).Value) & ""","
-                json = json & """Link"":""" & j(.Cells(1, lo.ListColumns("Link").Index).Value) & """"
-                json = json & "}"
-            End With
+            ' -- Relative path and pull Location/ObjectName --
+            If hasRel Then
+                relPath = CStr(r.Range.Cells(1, lo.ListColumns("RelativePath").Index).Value)
+            Else
+                relPath = ""
+            End If
+
+            If hasObjName Then
+                objectName = CStr(r.Range.Cells(1, lo.ListColumns("Object name").Index).Value)
+            Else
+                objectName = ""
+            End If
+
+            ' Location = parent of RelativePath (empty if top-level)
+            If Len(relPath) = 0 Then
+                location = ""
+            Else
+                lastSlash = InStrRev(relPath, "\")
+                If lastSlash > 0 Then
+                    location = Left$(relPath, lastSlash - 1)
+                Else
+                    location = ""
+                End If
+            End If
+
+            ' ObjectType from table
+            If hasObjType Then
+                objType = CStr(r.Range.Cells(1, lo.ListColumns("Object Type").Index).Value)
+            Else
+                objType = ""
+            End If
+
+            ' PrimaryName & ObjectTypeOut
+            Select Case LCase$(objType)
+                Case "category", "folder", "subfolder"
+                    primaryName = objectName
+                    objTypeOut = objType
+                Case Else
+                    dotPos = InStrRev(objectName, ".")
+                    If dotPos > 0 Then
+                        baseNoExt = Left$(objectName, dotPos - 1)
+                    Else
+                        baseNoExt = objectName
+                    End If
+
+                    If dotPos > 0 Then
+                        Dim extLower As String
+                        extLower = LCase$(Mid$(objectName, dotPos + 1))
+                        If extLower = "url" Or extLower = "lnk" Then
+                            baseNoExt = StripTrailingParenGroup(baseNoExt)
+                        End If
+                    End If
+                    primaryName = baseNoExt
+
+                    If Len(objType) > 0 Then
+                        objTypeOut = objType
+                    Else
+                        If InStrRev(objectName, ".") = 0 Then
+                            objTypeOut = "File"   ' no extension ? File
+                        Else
+                            objTypeOut = ""
+                        End If
+                    End If
+            End Select
+
+            ' Relevance (Low/Normal/High or blank?Medium)
+            If hasRelevance Then
+                relvRaw = Trim$(CStr(r.Range.Cells(1, lo.ListColumns("Relevance").Index).Value))
+            Else
+                relvRaw = ""
+            End If
+            Select Case LCase$(relvRaw)
+                Case "", "n", "normal": relvOut = "Normal"
+                Case "l", "low":       relvOut = "Low"
+                Case "h", "high":      relvOut = "High"
+                Case Else:             relvOut = "Normal"
+            End Select
+
+            ' Emit JSON row
+            json = json & sep & "{"
+            json = json & """Repository"":""" & j(shortName) & ""","
+            json = json & """Location"":""" & j(location) & ""","
+            json = json & """ObjectName"":""" & j(objectName) & ""","
+            json = json & """PrimaryName"":""" & j(primaryName) & ""","
+            json = json & """ObjectType"":""" & j(objTypeOut) & ""","
+            If hasDesc Then json = json & """Description"":""" & j(r.Range.Cells(1, lo.ListColumns("Description").Index).Value) & """," Else json = json & """Description"":"""","
+            If hasKw Then json = json & """Keywords"":""" & j(r.Range.Cells(1, lo.ListColumns("Keywords").Index).Value) & """," Else json = json & """Keywords"":"""","
+            If hasRef Then json = json & """Reference"":""" & j(r.Range.Cells(1, lo.ListColumns("Reference").Index).Value) & """," Else json = json & """Reference"":"""","
+            If hasDateDoc Then json = json & """DateDoc"":""" & j(r.Range.Cells(1, lo.ListColumns("Date Doc").Index).Value) & """," Else json = json & """DateDoc"":"""","
+            If hasApproved Then json = json & """Approved"":""" & j(r.Range.Cells(1, lo.ListColumns("Approved?").Index).Value) & """," Else json = json & """Approved"":"""","
+            json = json & """Relevance"":""" & j(relvOut) & ""","    ' << NEW FIELD
+            If hasLink Then json = json & """Link"":""" & j(r.Range.Cells(1, lo.ListColumns("Link").Index).Value) & """" Else json = json & """Link"":"""" "
+            json = json & "}"
+
             sep = ","
+            taken = taken + 1
+            If SMALL_SAMPLE And taken >= 10 Then Exit For
         End If
     Next r
 
     json = json & "]"
-    BuildJSONFromTableIgnoreYellow = json
+    BuildJSONFromWorkbookIgnoreYellow = json
 End Function
+
+
+' If s ends with " (...)" (a single parenthesized group) remove that suffix.
+' Example: "File3 (SharePoint Video)" -> "File3"
+Private Function StripTrailingParenGroup(ByVal s As String) As String
+    Dim pClose As Long, pOpen As Long
+    s = Trim$(s)
+    If Len(s) = 0 Then
+        StripTrailingParenGroup = s
+        Exit Function
+    End If
+
+    If Right$(s, 1) <> ")" Then
+        StripTrailingParenGroup = s
+        Exit Function
+    End If
+
+    pClose = Len(s)
+    pOpen = InStrRev(s, "(")
+    If pOpen > 0 And pOpen < pClose Then
+        ' Make sure there is exactly one space before "(" or it starts the string
+        Dim leftPart As String, midPart As String
+        leftPart = Left$(s, pOpen - 1)
+        midPart = Mid$(s, pOpen, pClose - pOpen + 1)
+        ' Heuristic: only strip if it's at the end and looks like a simple group
+        If pOpen > 1 And Mid$(s, pOpen - 1, 1) = " " Then
+            StripTrailingParenGroup = RTrim$(Left$(s, pOpen - 2 + 1))  ' remove space before "(" too
+        Else
+            StripTrailingParenGroup = Left$(s, pOpen - 1)
+        End If
+    Else
+        StripTrailingParenGroup = s
+    End If
+End Function
+
 
 ' JSON-escape helper
 Private Function j(ByVal v As Variant) As String
@@ -695,24 +923,40 @@ End Function
 
 
 Public Sub GenerateFileIndex()
-    Dim ws As Worksheet, loConfig As ListObject, loFiles As ListObject
+    Dim wbPrimary   As Excel.Workbook
+    Dim wbExtra     As Excel.Workbook
+    Dim wbTest      As Excel.Workbook
+
+    Dim ws          As Worksheet
+    Dim loConfig    As ListObject
+
     Dim templatePath As String, outputPath As String, repoName As String
-    Dim html As String, json As String
+    Dim html As String, json As String, jsonAll As String
     Dim stm As Object ' ADODB.Stream late-bound
     Dim found As Range
 
-    ' 1) tbConfig
-    For Each ws In ActiveWorkbook.Worksheets
+    Dim alsoPaths(1 To 4) As String
+    Dim i As Long, p As String
+
+    ' Use the ACTIVE workbook as the primary
+    Set wbPrimary = ActiveWorkbook
+    If wbPrimary Is Nothing Then
+        MsgBox "No active workbook.", vbCritical
+        Exit Sub
+    End If
+
+    ' 1) tbConfig in PRIMARY
+    For Each ws In wbPrimary.Worksheets
         On Error Resume Next
         Set loConfig = ws.ListObjects("tbConfig")
         On Error GoTo 0
         If Not loConfig Is Nothing Then Exit For
     Next ws
     If loConfig Is Nothing Then
-        MsgBox "Configuration table 'tbConfig' not found.", vbCritical: Exit Sub
+        MsgBox "Configuration table 'tbConfig' not found in primary workbook.", vbCritical: Exit Sub
     End If
 
-    ' Repository name
+    ' Repository name (for the HTML title, not the per-row Repository column)
     With loConfig.DataBodyRange
         Set found = .Columns(loConfig.ListColumns("Key").Index) _
             .Find(What:="Repository name", LookIn:=xlValues, LookAt:=xlWhole)
@@ -731,7 +975,7 @@ Public Sub GenerateFileIndex()
             .Find(What:="Html Template", LookIn:=xlValues, LookAt:=xlWhole)
     End With
     If found Is Nothing Then
-        MsgBox "No 'Html Template' in tbConfig.", vbCritical: Exit Sub
+        MsgBox "No 'Html Template' in tbConfig (primary).", vbCritical: Exit Sub
     End If
     templatePath = CStr(found.Offset(0, _
       loConfig.ListColumns("Value").Index - loConfig.ListColumns("Key").Index).Value)
@@ -742,12 +986,26 @@ Public Sub GenerateFileIndex()
             .Find(What:="Html Index file", LookIn:=xlValues, LookAt:=xlWhole)
     End With
     If found Is Nothing Then
-        MsgBox "No 'Html Index file' in tbConfig.", vbCritical: Exit Sub
+        MsgBox "No 'Html Index file' in tbConfig (primary).", vbCritical: Exit Sub
     End If
     outputPath = CStr(found.Offset(0, _
       loConfig.ListColumns("Value").Index - loConfig.ListColumns("Key").Index).Value)
 
-    ' 2) Read template
+    ' Also Read 1..4 (full paths, may be missing or blank)
+    For i = 1 To 4
+        With loConfig.DataBodyRange
+            Set found = .Columns(loConfig.ListColumns("Key").Index) _
+                .Find(What:="Also Read " & CStr(i), LookIn:=xlValues, LookAt:=xlWhole)
+        End With
+        If Not found Is Nothing Then
+            alsoPaths(i) = Trim$(CStr(found.Offset(0, _
+              loConfig.ListColumns("Value").Index - loConfig.ListColumns("Key").Index).Value))
+        Else
+            alsoPaths(i) = ""
+        End If
+    Next i
+
+    ' 2) Read HTML template from disk
     Set stm = CreateObject("ADODB.Stream")
     With stm
         .Type = 2 ' text
@@ -758,16 +1016,67 @@ Public Sub GenerateFileIndex()
         .Close
     End With
 
-    ' 3) Build JSON from tbFiles, ignoring yellow rows
-    json = BuildJSONFromTableIgnoreYellow()
+    ' 3) Build JSON for PRIMARY workbook
+    jsonAll = BuildJSONFromWorkbookIgnoreYellow(wbPrimary)
 
-    ' 4) Replace REPNAME and timestamp
+    ' 4) For each "Also Read N" path, try to open and append JSON
+    Dim baseName As String
+    For i = 1 To 4
+        p = alsoPaths(i)
+        If Len(p) > 0 Then
+            baseName = Dir$(p)
+            Set wbExtra = Nothing
+
+            ' Try to open the workbook (ignore macros inside extra workbooks)
+            On Error Resume Next
+            Application.Workbooks.Open fileName:=p, ReadOnly:=True
+            ' If there was a real failure, Err.Number will be non-zero
+            If Err.Number <> 0 Then
+                Debug.Print "Failed to open extra workbook: " & p & "  Err " & Err.Number & ": " & Err.Description
+                MsgBox "Failed to open extra workbook: " & p & "  Err " & Err.Number & ": " & Err.Description, vbCritical
+                Err.Clear
+                On Error GoTo 0
+            Else
+                ' Find the workbook object by FullName
+                On Error GoTo 0
+                For Each wbTest In Application.Workbooks
+                    If StrComp(wbTest.Name, baseName, vbTextCompare) = 0 Then
+                        Set wbExtra = wbTest
+                        Exit For
+                    End If
+                Next wbTest
+
+                If wbExtra Is Nothing Then
+                    Debug.Print "Opened extra workbook but could not resolve object for: " & p
+                Else
+                    Dim jsonExtra As String
+                    jsonExtra = BuildJSONFromWorkbookIgnoreYellow(wbExtra)
+
+                    ' Merge JSON arrays: remove trailing ']' from jsonAll and leading '[' from jsonExtra
+                    If jsonAll = "[]" Then
+                        jsonAll = jsonExtra
+                    ElseIf jsonExtra <> "[]" Then
+                        jsonAll = Left$(jsonAll, Len(jsonAll) - 1) & _
+                                  "," & Mid$(jsonExtra, 2)
+                    End If
+
+                    ' Optionally close extra workbook afterwards (no save)
+                    wbExtra.Close SaveChanges:=False
+                End If
+            End If
+        End If
+    Next i
+
+    ' If for some reason jsonAll ended empty, normalize
+    If Len(jsonAll) = 0 Then jsonAll = "[]"
+
+    ' 5) Replace REPNAME and timestamp
     html = Replace(html, "REPNAME", repoName, , , vbTextCompare)
     Dim stamp As String
     stamp = Format(Now, "d mmm HH:nn")
     html = Replace(html, "1 Jan 23:45", stamp, , , vbTextCompare)
 
-    ' 5) Replace const fileData = [ ... ];
+    ' 6) Inject const fileData = ...;
     Dim startPos As Long, openPos As Long, endPos As Long
     Dim before As String, after As String
     startPos = InStr(1, html, "const fileData =", vbTextCompare)
@@ -775,13 +1084,13 @@ Public Sub GenerateFileIndex()
         openPos = InStr(startPos, html, "[")
         endPos = InStr(openPos, html, "];")
         If openPos > 0 And endPos > 0 Then
-            before = Left$(html, startPos - 1)          ' <-- fix here
-            after = Mid$(html, endPos + 2)              ' keep content after ];
-            html = before & "const fileData = " & json & ";" & after
+            before = Left$(html, startPos - 1)
+            after = Mid$(html, endPos + 2)
+            html = before & "const fileData = " & jsonAll & ";" & after
         End If
     End If
-    
-    ' 6) Write output utf-8
+
+    ' 7) Write output utf-8
     Set stm = CreateObject("ADODB.Stream")
     With stm
         .Type = 2 ' text
@@ -795,6 +1104,17 @@ Public Sub GenerateFileIndex()
     MsgBox "HTML index written to:" & vbCrLf & outputPath, vbInformation
 End Sub
 
+
+
+Private Function GetWorkbookByFullName(ByVal fullPath As String) As Workbook
+    Dim wb As Workbook
+    For Each wb In Application.Workbooks
+        If StrComp(wb.FullName, fullPath, vbTextCompare) = 0 Then
+            Set GetWorkbookByFullName = wb
+            Exit Function
+        End If
+    Next wb
+End Function
 
 
 '-----------------------------------------------
@@ -978,6 +1298,7 @@ Public Sub QuickSortArray(vArray As Variant, inLow As Long, inHi As Long)
     If (tmpLow < inHi) Then QuickSortArray vArray, tmpLow, inHi
 End Sub
 
+' Initialize visited guard before recursion (CHANGED)
 Public Sub ScanFoldersAndFiles(ByVal rootFolderPath As String, ByRef containerOut As MyContainer)
     Dim fso As Scripting.FileSystemObject
     Set fso = New Scripting.FileSystemObject
@@ -985,6 +1306,9 @@ Public Sub ScanFoldersAndFiles(ByVal rootFolderPath As String, ByRef containerOu
     If Not fso.FolderExists(rootFolderPath) Then
         Err.Raise vbObjectError + 100, , "Folder not found: " & rootFolderPath
     End If
+
+    ' reset visited set for this run
+    Set visited = CreateObject("Scripting.Dictionary")
 
     Dim rootFolder As Scripting.Folder
     Set rootFolder = fso.GetFolder(rootFolderPath)
@@ -995,11 +1319,16 @@ Public Sub ScanFoldersAndFiles(ByVal rootFolderPath As String, ByRef containerOu
     RecursiveFolderScan rootFolder, containerOut, rootFolderPath, 1
 End Sub
 
+' Add re-visit guard at the very start (CHANGED)
 Private Sub RecursiveFolderScan( _
         ByVal Folder As Scripting.Folder, _
         ByRef containerOut As MyContainer, _
         ByVal theRoot As String, _
         ByVal theLevel As Integer)
+
+    If visited Is Nothing Then Set visited = CreateObject("Scripting.Dictionary")
+    If visited.Exists(Folder.Path) Then Exit Sub
+    visited.Add Folder.Path, True
 
     Dim fileContainer   As MyContainer
     Dim subfolder       As Scripting.Folder
@@ -1020,54 +1349,35 @@ Private Sub RecursiveFolderScan( _
         If (subfolder.Attributes And 6) = 0 Then
             Set aDescriptor = New FileDescriptor
 
-            ' path under root (no leading "\")
             relPath = Mid$(subfolder.Path, Len(theRoot) + 1)
             parts = Split(relPath, "\")
-            depth = UBound(parts)      ' 0-based
+            depth = UBound(parts)
 
-            ' FOLDER: Domain = parts(0), Category = parts(1), Folder = parts(2)
-            If depth >= 0 Then
-                aDescriptor.Domain = parts(0)
-            Else
-                aDescriptor.Domain = ""
-            End If
-            If depth >= 1 Then
-                aDescriptor.Category = parts(1)
-            Else
-                aDescriptor.Category = ""
-            End If
-            If depth >= 2 Then
-                aDescriptor.Folder = parts(2)
-            Else
-                aDescriptor.Folder = ""
-            End If
+            If depth >= 0 Then aDescriptor.Domain = parts(0) Else aDescriptor.Domain = ""
+            If depth >= 1 Then aDescriptor.Category = parts(1) Else aDescriptor.Category = ""
+            If depth >= 2 Then aDescriptor.Folder = parts(2) Else aDescriptor.Folder = ""
 
-            ' ObjectType by depth
             Select Case depth
-              Case 0
-                aDescriptor.ObjectType = "Domain"
-              Case 1
-                aDescriptor.ObjectType = "Category"
-              Case 2
-                aDescriptor.ObjectType = "Folder"
-              Case Else
-                aDescriptor.ObjectType = "Subfolder"
+              Case 0: aDescriptor.ObjectType = "Domain"
+              Case 1: aDescriptor.ObjectType = "Category"
+              Case 2: aDescriptor.ObjectType = "Folder"
+              Case Else: aDescriptor.ObjectType = "Subfolder"
             End Select
 
             aDescriptor.fileName = subfolder.Name
 
-            ' build basePath for ObjectName
             basePath = theRoot
             If aDescriptor.Domain <> "" Then basePath = basePath & "\" & aDescriptor.Domain
             If aDescriptor.Category <> "" Then basePath = basePath & "\" & aDescriptor.Category
             If aDescriptor.Folder <> "" Then basePath = basePath & "\" & aDescriptor.Folder
 
-            aDescriptor.ObjectName = Replace(Mid$(subfolder.Path, Len(basePath) + 1), "\", "/")
+            aDescriptor.objectName = Replace(Mid$(subfolder.Path, Len(basePath) + 1), "\", "/")
             aDescriptor.RelativePath = relPath
 
             fileContainer.Add aDescriptor, subfolder.Name
             RecursiveFolderScan subfolder, containerOut, theRoot, theLevel + 1
         End If
+        If (subfolder.Files.Count Mod 200) = 0 Then DoEvents
     Next
 
     '--- Process files ---
@@ -1077,49 +1387,31 @@ Private Sub RecursiveFolderScan( _
 
             relPath = Mid$(file.Path, Len(theRoot) + 1)
             parts = Split(relPath, "\")
-            depth = UBound(parts)      ' last element is file name
+            depth = UBound(parts)
 
-            ' FILE: parentDepth = depth-1
-            ' Domain from parts(0) if exists
-            If depth >= 1 Then
-                aDescriptor.Domain = parts(0)
-            Else
-                aDescriptor.Domain = ""
-            End If
-
-            ' Category from parts(1) if exists
-            If depth >= 2 Then
-                aDescriptor.Category = parts(1)
-            Else
-                aDescriptor.Category = ""
-            End If
-
-            ' Folder from parts(2) if exists
-            If depth >= 3 Then
-                aDescriptor.Folder = parts(2)
-            Else
-                aDescriptor.Folder = ""
-            End If
+            If depth >= 1 Then aDescriptor.Domain = parts(0) Else aDescriptor.Domain = ""
+            If depth >= 2 Then aDescriptor.Category = parts(1) Else aDescriptor.Category = ""
+            If depth >= 3 Then aDescriptor.Folder = parts(2) Else aDescriptor.Folder = ""
 
             aDescriptor.ObjectType = GetFileFormat(file.Name)
             aDescriptor.fileName = parts(depth)
 
-            ' build basePath for ObjectName
             basePath = theRoot
             If aDescriptor.Domain <> "" Then basePath = basePath & "\" & aDescriptor.Domain
             If aDescriptor.Category <> "" Then basePath = basePath & "\" & aDescriptor.Category
             If aDescriptor.Folder <> "" Then basePath = basePath & "\" & aDescriptor.Folder
 
-            aDescriptor.ObjectName = Replace(Mid$(file.Path, Len(basePath) + 1), "\", "/")
+            aDescriptor.objectName = Replace(Mid$(file.Path, Len(basePath) + 1), "\", "/")
             aDescriptor.RelativePath = relPath
 
             fileContainer.Add aDescriptor, file.Name
         End If
+        If (Folder.Files.Count Mod 400) = 0 Then DoEvents
     Next
 
-    '--- Attach to parent ---
     containerOut.Add fileContainer, Folder.Path
 End Sub
+
 
 Function GetFileFormat(fileName As String) As String
     Dim ext As String
@@ -1149,4 +1441,5 @@ Function GetFileFormat(fileName As String) As String
             GetFileFormat = LCase(ext)
     End Select
 End Function
+
 
