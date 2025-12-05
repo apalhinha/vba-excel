@@ -2,13 +2,18 @@ Attribute VB_Name = "FolderScan_M"
 Option Explicit
 
 Private visited As Object  ' used by RecursiveFolderScan guard
+Private Const MAX_SCAN_DEPTH As Long = 40  ' safety guard against runaway recursion
+
+Private scanSteps As Long
+Private Const SCAN_MAX_STEPS As Long = 200000   ' safety cutoff
 
 Public Sub FolderScan()
     Const DO_SORT As Boolean = True
-    Const DO_HYPERLINKS As Boolean = False
+    Const DO_HYPERLINKS As Boolean = True
     Const DO_PAINT_MISSING As Boolean = True
     Const DO_REFRESH_ALL As Boolean = True
-    Const DO_UPDATE_KW As Boolean = True
+    Const DO_UPDATE_KW As Boolean = False
+    Const DO_TEST_CTRL_FILENAME As Boolean = True
 
     Dim ws As Worksheet
     Dim loConfig As ListObject, loFiles As ListObject
@@ -17,7 +22,7 @@ Public Sub FolderScan()
     Dim urlPrefix As String, urlSuffix As String
 
     Dim r As ListRow, rowToUpdate As ListRow
-    Dim allDescs As Collection, desc As FileDescriptor
+    Dim desc As FileDescriptor
 
     Dim objType As String, showVal As String
     Dim cellVal As Variant
@@ -26,11 +31,9 @@ Public Sub FolderScan()
     Dim colNumber As Long, colDateFound As Long, colKeywords As Long
     Dim colDomain As Long, colCategory As Long, colFolder As Long
     Dim colObjType As Long
-    Dim colFileName As Long                  ' <-- now points to "Object name"
+    Dim colFileName As Long
     Dim colRelPath As Long, colShow As Long, colLink As Long
-
-    Dim parts() As String, n As Long, isFolderObj As Boolean
-    Dim fullPath As String, t As String
+    Dim colError As Long
 
     ' repositories / sets
     Dim existingRows As Object
@@ -43,14 +46,13 @@ Public Sub FolderScan()
 
     Dim toKeep As Object
     Dim toAdd As Object
-    Dim toMissing As Object
 
     Dim baseNewSet As Object
     Dim showDefaults As Object
 
-    Dim keysArr As Variant, kKey As Variant, childKey As Variant
-    Dim parentPath As String, p As Long, diff As Long
-    Dim rp As String, effRule As String, effRulePath As String, tmpPath As String
+    Dim keysArr As Variant, kRel As Variant
+    Dim parentPath As String, p As Long
+    Dim rp As String
 
     Dim blankNumberCells As Collection
     Dim newKeys As Variant
@@ -58,8 +60,15 @@ Public Sub FolderScan()
     Dim batchData() As Variant, startRow As Long, targetRange As Range, c As Range
 
     Dim encRel As String, computedLink As String, isShortcut As Boolean
+    Dim totalNew As Long, idx As Long, thisCount As Long
+    Dim updSteps As Long
 
     Const NEWROW_COLOR As Long = &HF7EBDD   ' RGB(221,235,247)
+
+    ' timing
+    Dim tBlock As Double, tTotal As Double
+    tTotal = Timer
+    Debug.Print "FolderScan - START at " & Format$(Now, "hh:nn:ss")
 
     On Error GoTo CleanFail
     Application.EnableCancelKey = xlErrorHandler
@@ -68,6 +77,9 @@ Public Sub FolderScan()
     Application.EnableEvents = False
 
     '— 1) tbConfig —
+    tBlock = Timer
+    Debug.Print "ENTER 1) tbConfig at " & Format$(Now, "hh:nn:ss")
+
     For Each ws In ActiveWorkbook.Worksheets
         On Error Resume Next
         Set loConfig = ws.ListObjects("tbConfig")
@@ -106,7 +118,12 @@ Public Sub FolderScan()
         urlSuffix = ""
     End If
 
-    '— 2) tbFiles —  [Lap "Bind columns; 'Object name' is the single name column"]
+    Debug.Print "EXIT  1) tbConfig, secs=" & Format$(Timer - tBlock, "0.000")
+
+    '— 2) tbFiles —
+    tBlock = Timer
+    Debug.Print "ENTER 2) tbFiles at " & Format$(Now, "hh:nn:ss")
+
     For Each ws In ActiveWorkbook.Worksheets
         On Error Resume Next
         Set loFiles = ws.ListObjects("tbFiles")
@@ -122,12 +139,13 @@ Public Sub FolderScan()
     colCategory = loFiles.ListColumns("Category").Index
     colFolder = loFiles.ListColumns("Folder").Index
     colObjType = loFiles.ListColumns("Object Type").Index
-    colFileName = loFiles.ListColumns("Object name").Index   ' <-- renamed target column
+    colFileName = loFiles.ListColumns("Object name").Index
     colRelPath = loFiles.ListColumns("RelativePath").Index
     colLink = IIf(ColumnExists(loFiles, "Link"), loFiles.ListColumns("Link").Index, 0)
     colShow = IIf(ColumnExists(loFiles, "Show?"), loFiles.ListColumns("Show?").Index, 0)
+    colError = IIf(ColumnExists(loFiles, "Error?"), loFiles.ListColumns("Error?").Index, 0)
 
-    ' Clear visuals up-front  [Lap "Ensure neutral canvas before this run"]
+    ' Clear visuals up-front
     If Not loFiles.DataBodyRange Is Nothing Then
         With loFiles.DataBodyRange
             .FormatConditions.Delete
@@ -137,7 +155,12 @@ Public Sub FolderScan()
         End With
     End If
 
-    '— 3) Snapshot Excel repository —  [Lap "Existing rows, Show? rules, numbering"]
+    Debug.Print "EXIT  2) tbFiles, secs=" & Format$(Timer - tBlock, "0.000")
+
+    '— 3) Snapshot Excel repository —
+    tBlock = Timer
+    Debug.Print "ENTER 3) Snapshot Excel repo at " & Format$(Now, "hh:nn:ss")
+
     Dim relKey As String
     Set existingRows = CreateObject("Scripting.Dictionary")
     Set existingRelSet = CreateObject("Scripting.Dictionary")
@@ -148,7 +171,10 @@ Public Sub FolderScan()
 
     For Each r In loFiles.ListRows
         If Not IsError(r.Range.Cells(1, colRelPath).Value) Then
-            relKey = CStr(r.Range.Cells(1, colRelPath).Value)
+            ' Normalize path (kills ZERO WIDTH SPACE etc) and write it back into Excel
+            relKey = NormalizePath(CStr(r.Range.Cells(1, colRelPath).Value))
+            r.Range.Cells(1, colRelPath).Value = relKey
+
             If existingRows.Exists(relKey) Then existingRows.Remove relKey
             existingRows.Add relKey, r
             If Not existingRelSet.Exists(relKey) Then existingRelSet.Add relKey, True
@@ -162,11 +188,45 @@ Public Sub FolderScan()
         If CStr(r.Range.Cells(1, colObjType).Value) = "Category" Or _
            CStr(r.Range.Cells(1, colObjType).Value) = "Folder" Or _
            CStr(r.Range.Cells(1, colObjType).Value) = "Subfolder" Then
+
             If colShow > 0 Then
                 showVal = LCase$(Trim$(CStr(r.Range.Cells(1, colShow).Value)))
                 If Len(showVal) > 0 Then
+                    ' normalize textual value and update both dictionary and cell
+                    Select Case showVal
+                        Case "all"
+                            showVal = "all"
+                            r.Range.Cells(1, colShow).Value = "All"
+                        Case "nothing"
+                            showVal = "nothing"
+                            r.Range.Cells(1, colShow).Value = "Nothing"
+                        Case "1st level", "1stlevel", "1st-level"
+                            showVal = "1st level"
+                            r.Range.Cells(1, colShow).Value = "1st Level"
+                        Case Else
+                            ' unknown value: treat as "nothing"
+                            showVal = "nothing"
+                            r.Range.Cells(1, colShow).Value = "Nothing"
+                    End Select
+
                     If showSettings.Exists(relKey) Then showSettings.Remove relKey
                     showSettings.Add relKey, showVal
+                End If
+            End If
+        End If
+
+        ' optional test for control codes in filename on existing rows ---
+        If DO_TEST_CTRL_FILENAME And colError > 0 Then
+            Dim fn As String
+            Dim normName As String
+            fn = CStr(r.Range.Cells(1, colFileName).Value)
+
+            If Len(fn) > 0 Then
+                normName = NormalizePath(fn)
+                If normName <> fn Then
+                    If Len(Trim$(CStr(r.Range.Cells(1, colError).Value))) = 0 Then
+                        r.Range.Cells(1, colError).Value = "Control codes in filename"
+                    End If
                 End If
             End If
         End If
@@ -180,124 +240,53 @@ Public Sub FolderScan()
     Next r
     nextNum = maxNum + 1
 
-    '— 4) Scan filesystem —  [Lap "Collect descriptors from disk"]
-    Set allDescs = New Collection
-    ScanFoldersCollectDescriptors aLocalRoot, allDescs
+    Debug.Print "EXIT  3) Snapshot Excel repo, secs=" & Format$(Timer - tBlock, "0.000")
 
-    '— 4b) Map / shortcuts —  [Lap "Normalize types; preserve case for (.url/.lnk) parenthesis tag"]
-    Dim isUrl As Boolean, isLnk As Boolean
-    For Each desc In allDescs
-        desc.Domain = domainName
+    '— 4) Scan filesystem with Show? inheritance in recursion —
+    tBlock = Timer
+    Debug.Print "ENTER 4) Scan filesystem at " & Format$(Now, "hh:nn:ss")
 
-        isFolderObj = isFolder(desc.ObjectType)
-        parts = Split(desc.RelativePath, "\")
-        n = UBound(parts)
-
-        If isFolderObj Then
-            If n >= 0 Then desc.Category = parts(0) Else desc.Category = ""
-            If n >= 1 Then desc.Folder = parts(1) Else desc.Folder = ""
-            Select Case n
-                Case 0: desc.ObjectType = "Category"
-                Case 1: desc.ObjectType = "Folder"
-                Case Else: desc.ObjectType = "Subfolder"
-            End Select
-        Else
-            If n >= 1 Then desc.Category = parts(0) Else desc.Category = ""
-            If n >= 2 Then desc.Folder = parts(1) Else desc.Folder = ""
-
-            isUrl = EndsWithCI(desc.fileName, ".url")
-            isLnk = EndsWithCI(desc.fileName, ".lnk")
-
-            If isUrl Or isLnk Then
-                fullPath = aLocalRoot & desc.RelativePath
-                desc.Link = ResolveShortcutLink(fullPath)
-
-                t = DeriveShortcutTypeFromName(desc.fileName)
-                If Len(t) > 0 Then
-                    desc.ObjectType = t      ' preserve case
-                Else
-                    desc.ObjectType = "shortcut"
-                End If
-            End If
-        End If
-    Next desc
-
-    '— 5) Apply Show? rules —  [Lap "Inner-most rule wins; guard against path-walk loops"]
     Set allowed = CreateObject("Scripting.Dictionary")
-    Dim guard As Long
-    For Each desc In allDescs
-        rp = desc.RelativePath
-        effRule = "": effRulePath = "": tmpPath = rp
-        guard = 0
-        Do While Len(tmpPath) > 0
-            guard = guard + 1
-            If guard > 200 Then Err.Raise vbObjectError + 911, , "Guard tripped in Show?-walk: " & tmpPath
+    ScanFilesystemWithShow aLocalRoot, domainName, showSettings, allowed
 
-            If showSettings.Exists(tmpPath) Then
-                effRule = CStr(showSettings(tmpPath))
-                effRulePath = tmpPath
-                Exit Do
-            End If
-            p = InStrRev(tmpPath, "\")
-            If p > 0 Then tmpPath = Left$(tmpPath, p - 1) Else Exit Do
-        Loop
+    Debug.Print "EXIT  4) Scan filesystem, secs=" & Format$(Timer - tBlock, "0.000")
 
-        Dim skip As Boolean: skip = False
-        If Len(effRule) > 0 Then
-            Select Case effRule
-                Case "all"
-                Case "nothing"
-                    If LCase$(rp) <> LCase$(effRulePath) Then skip = True
-                Case "subfolders"
-                    If LCase$(rp) <> LCase$(effRulePath) Then
-                        If Not (desc.ObjectType = "Category" Or desc.ObjectType = "Folder" Or desc.ObjectType = "Subfolder") Then
-                            skip = True
-                        End If
-                    End If
-                Case "1st level"
-                    If LCase$(rp) <> LCase$(effRulePath) Then
-                        diff = UBound(Split(rp, "\")) - UBound(Split(effRulePath, "\")) + 0
-                        If diff > 1 Then skip = True
-                    End If
-            End Select
-        End If
+    '— 5) sets: Excel vs FS —
+    tBlock = Timer
+    Debug.Print "ENTER 5) Build sets Excel vs FS at " & Format$(Now, "hh:nn:ss")
 
-        If Not skip Then
-            If allowed.Exists(rp) Then allowed.Remove rp
-            allowed.Add rp, desc
-        End If
-        If (allowed.Count Mod 200) = 0 Then DoEvents
-    Next desc
-
-    '— sets: Excel vs FS —  [Lap "Partition into Keep / Add / Missing"]
     Set fsRelSet = CreateObject("Scripting.Dictionary")
-    Dim kRel As Variant
     For Each kRel In allowed.keys
-        fsRelSet.Add CStr(kRel), True
+        fsRelSet.Add NormalizePath(CStr(kRel)), True
     Next kRel
 
     Set toKeep = CreateObject("Scripting.Dictionary")
     Set toAdd = CreateObject("Scripting.Dictionary")
-    Set toMissing = CreateObject("Scripting.Dictionary")
 
     For Each kRel In existingRelSet.keys
         If fsRelSet.Exists(CStr(kRel)) Then
             toKeep.Add CStr(kRel), True
-        Else
-            toMissing.Add CStr(kRel), True
         End If
+        ' If FS does not have it, we will just paint it yellow at the end
     Next kRel
+
     For Each kRel In fsRelSet.keys
         If Not existingRelSet.Exists(CStr(kRel)) Then
             toAdd.Add CStr(kRel), True
         End If
     Next kRel
 
-    '— defaults for new base folders —  [Lap "Pre-fill Show? on first-time folders"]
+    Debug.Print "EXIT  5) Build sets Excel vs FS, secs=" & Format$(Timer - tBlock, "0.000")
+
+    '— 6) defaults for new base folders (Show? for new folder rows) —
+    tBlock = Timer
+    Debug.Print "ENTER 6) Compute Show? defaults for new folders at " & Format$(Now, "hh:nn:ss")
+
     Set baseNewSet = CreateObject("Scripting.Dictionary")
     Set showDefaults = CreateObject("Scripting.Dictionary")
     keysArr = allowed.keys
 
+    ' identify new folder paths whose parent is root or an existing folder row
     For Each kRel In keysArr
         rp = CStr(kRel)
         Set desc = allowed(rp)
@@ -312,42 +301,111 @@ Public Sub FolderScan()
         End If
     Next kRel
 
+    ' For each new folder, compute parent effective rule, and set default Show?
+    Dim parentEffRule As String, parentEffPath As String
+    Dim parentFromExplicit As Boolean
+    Dim tmpParent As String, guard2 As Long, p2 As Long
+
     For Each kRel In baseNewSet.keys
         rp = CStr(kRel)
         p = InStrRev(rp, "\")
         If p > 0 Then parentPath = Left$(rp, p - 1) Else parentPath = ""
 
-        Dim parentRule As String: parentRule = ""
-        If Len(parentPath) > 0 Then
-            If showSettings.Exists(parentPath) Then parentRule = LCase$(CStr(showSettings(parentPath)))
+        parentEffRule = ""
+        parentEffPath = ""
+        parentFromExplicit = False
+        tmpParent = parentPath
+        guard2 = 0
+
+        Do While Len(tmpParent) > 0
+            guard2 = guard2 + 1
+            If guard2 > 200 Then Err.Raise vbObjectError + 912, , "Guard tripped in parent Show?-walk: " & tmpParent
+
+            If showSettings.Exists(tmpParent) Then
+                parentEffRule = CStr(showSettings(tmpParent))
+                parentEffPath = tmpParent
+                parentFromExplicit = True
+                Exit Do
+            End If
+
+            p2 = InStrRev(tmpParent, "\")
+            If p2 > 0 Then
+                tmpParent = Left$(tmpParent, p2 - 1)
+            Else
+                Exit Do
+            End If
+        Loop
+
+        If Len(parentEffRule) = 0 Then
+            ' No explicit rule found above ? implicit root rule = "1st level"
+            parentEffRule = "1st level"
+            parentEffPath = ""
+            parentFromExplicit = False
         End If
 
-        If parentRule = "1st level" Then
-            If Not showDefaults.Exists(rp) Then showDefaults.Add rp, "Nothing"
-        Else
-            If Not showDefaults.Exists(rp) Then showDefaults.Add rp, "1st Level"
+        If Not showDefaults.Exists(rp) Then
+            Select Case parentEffRule
+                Case "all"
+                    showDefaults.Add rp, "All"
+
+                Case "1st level"
+                    If parentFromExplicit Then
+                        ' explicit 1st Level ? children get "Nothing"
+                        showDefaults.Add rp, "Nothing"
+                    Else
+                        ' implicit root 1st Level ? default "1st Level"
+                        showDefaults.Add rp, "1st Level"
+                    End If
+
+                Case "nothing"
+                    showDefaults.Add rp, "Nothing"
+
+                Case Else
+                    showDefaults.Add rp, "Nothing"
+            End Select
         End If
     Next kRel
 
-    '— update keep —  [Lap "Refresh metadata on rows that still exist on disk"]
+    Debug.Print "EXIT  6) Compute Show? defaults for new folders, secs=" & Format$(Timer - tBlock, "0.000")
+
+    '— 7) update keep —
+    tBlock = Timer
+    Debug.Print "ENTER 7) Update kept rows at " & Format$(Now, "hh:nn:ss")
+
+    updSteps = 0
+
     For Each kRel In toKeep.keys
         rp = CStr(kRel)
-        If existingRows.Exists(rp) Then
+
+        ' Safety: skip if we somehow lack the descriptor
+        If existingRows.Exists(rp) And allowed.Exists(rp) Then
             Set rowToUpdate = existingRows(rp)
             Set desc = allowed(rp)
+
             With rowToUpdate.Range
                 .Cells(1, colDomain).Value = desc.Domain
                 .Cells(1, colCategory).Value = desc.Category
-                .Cells(1, colFolder).Value = desc.Folder
+                .Cells(1, colFolder).Value = desc.folder
                 .Cells(1, colObjType).Value = desc.ObjectType
-                .Cells(1, colFileName).Value = desc.fileName      ' <-- write to "Object name"
+                .Cells(1, colFileName).Value = desc.fileName
                 .Cells(1, colRelPath).Value = desc.RelativePath
                 .Cells(1, colKeywords).Value = CleanKeywords(.Cells(1, colKeywords).Value)
             End With
         End If
+
+        updSteps = updSteps + 1
+        If (updSteps Mod 200) = 0 Then
+            DoEvents    ' lets Esc/cancel be processed
+        End If
     Next kRel
 
-    ' numbering fill  [Lap "Assign new IDs to blanks, keep monotonic growth"]
+    Debug.Print "EXIT  7) Update kept rows, rows=" & updSteps & _
+                " secs=" & Format$(Timer - tBlock, "0.000")
+
+    '— 8) numbering fill —
+    tBlock = Timer
+    Debug.Print "ENTER 8) Numbering fill at " & Format$(Now, "hh:nn:ss")
+
     If blankNumberCells.Count > 0 Then
         For Each c In blankNumberCells
             If Len(Trim$(CStr(c.Value))) = 0 Then
@@ -357,11 +415,18 @@ Public Sub FolderScan()
         Next c
     End If
 
-    '— add new in batch & paint blue —  [Lap "Append new rows and highlight"]
+    Debug.Print "EXIT  8) Numbering fill, secs=" & Format$(Timer - tBlock, "0.000")
+
+    '— 9) add new in batch & paint blue —
+    tBlock = Timer
+    Debug.Print "ENTER 9) Add new rows at " & Format$(Now, "hh:nn:ss")
+
     If toAdd.Count > 0 Then
         newKeys = toAdd.keys
         If Not IsEmpty(newKeys) Then
-            If UBound(newKeys) > LBound(newKeys) Then QuickSortArray newKeys, LBound(newKeys), UBound(newKeys)
+            If UBound(newKeys) > LBound(newKeys) Then
+                QuickSortArray newKeys, LBound(newKeys), UBound(newKeys)
+            End If
         End If
 
         numRows = toAdd.Count
@@ -373,10 +438,18 @@ Public Sub FolderScan()
             rp = CStr(kRel)
             Set desc = allowed(rp)
 
-            isShortcut = EndsWithCI(desc.fileName, ".lnk") Or EndsWithCI(desc.fileName, ".url")
+            '--- compute link (shortcuts vs normal files) ---
+            isShortcut = EndsWithCI(desc.fileName, ".lnk") Or _
+                         EndsWithCI(desc.fileName, ".url")
+
             If isShortcut Then
-                computedLink = Trim$(desc.Link)
+                ' Resolve ONLY for shortcuts
+                computedLink = ResolveShortcutLink(aLocalRoot & desc.RelativePath)
+                If Len(Trim$(computedLink)) = 0 Then
+                    computedLink = "no link"
+                End If
             Else
+                ' Normal file: build SharePoint URL from RelativePath
                 encRel = Replace(desc.RelativePath, "\", "/")
                 encRel = Replace(encRel, "%", "%25")
                 encRel = Replace(encRel, " ", "%20")
@@ -393,16 +466,20 @@ Public Sub FolderScan()
                 encRel = Replace(encRel, "(", "%28")
                 encRel = Replace(encRel, ")", "%29")
                 encRel = Replace(encRel, "=", "%3D")
+
                 computedLink = urlPrefix & encRel & urlSuffix
             End If
 
+            '--- write main data into batch array ---
             batchData(i, colDomain) = desc.Domain
             batchData(i, colCategory) = desc.Category
-            batchData(i, colFolder) = desc.Folder
+            batchData(i, colFolder) = desc.folder
             batchData(i, colObjType) = desc.ObjectType
-            batchData(i, colFileName) = desc.fileName      ' <-- write to "Object name"
+            batchData(i, colFileName) = desc.fileName
             batchData(i, colRelPath) = desc.RelativePath
-            If colLink > 0 Then batchData(i, colLink) = computedLink
+            If colLink > 0 Then
+                batchData(i, colLink) = computedLink
+            End If
             batchData(i, colNumber) = nextNum
             batchData(i, colDateFound) = Date
             batchData(i, colKeywords) = ""
@@ -415,11 +492,23 @@ Public Sub FolderScan()
                 End If
             End If
 
+            '--- new-row filename control-code test (Error? kept with priority) ---
+            If colError > 0 Then
+                If Len(Trim$(CStr(batchData(i, colError)))) = 0 Then
+                    Dim normNameTest As String
+                    normNameTest = NormalizePath(desc.fileName)
+                    If normNameTest <> desc.fileName Then
+                        batchData(i, colError) = "Control codes in filename"
+                    End If
+                End If
+            End If
+
             nextNum = nextNum + 1
             i = i + 1
             If (i Mod 200) = 0 Then DoEvents
         Next kRel
 
+        ' actually add the rows to tbFiles
         For i = 1 To numRows
             loFiles.ListRows.Add
         Next i
@@ -429,6 +518,7 @@ Public Sub FolderScan()
         targetRange.Value = batchData
         targetRange.Interior.Color = NEWROW_COLOR
 
+        ' clean keywords for new rows
         If colKeywords > 0 Then
             For Each c In targetRange.Columns(colKeywords).Cells
                 c.Value = CleanKeywords(c.Value)
@@ -436,12 +526,88 @@ Public Sub FolderScan()
         End If
     End If
 
-    '— links —  [Lap "Optional: make Link column clickable without changing value"]
+    Debug.Print "EXIT  9) Add new rows, secs=" & Format$(Timer - tBlock, "0.000")
+
+    '— 10) fill Show? for existing folder rows that are blank —
+    tBlock = Timer
+    Debug.Print "ENTER 10) Fill blank Show? in existing folders at " & Format$(Now, "hh:nn:ss")
+
+    If colShow > 0 Then
+        Dim showOrig As String
+        Dim rpFolder As String
+        Dim tmpPath2 As String
+        Dim effRule2 As String
+        Dim guard3 As Long
+        Dim p3 As Long
+        Dim baseRule As String
+
+        For Each r In loFiles.ListRows
+            objType = CStr(r.Range.Cells(1, colObjType).Value)
+            If objType = "Category" Or objType = "Folder" Or objType = "Subfolder" Then
+                showOrig = Trim$(CStr(r.Range.Cells(1, colShow).Value))
+                If Len(showOrig) = 0 Then
+                    rpFolder = CStr(r.Range.Cells(1, colRelPath).Value)
+
+                    effRule2 = ""
+                    tmpPath2 = rpFolder
+                    guard3 = 0
+
+                    ' Walk up to find first non-blank rule. If "1st level" is found,
+                    ' this path inherits "nothing" (deeper than first level)
+                    Do While Len(tmpPath2) > 0
+                        guard3 = guard3 + 1
+                        If guard3 > 200 Then Exit Do
+
+                        If showSettings.Exists(tmpPath2) Then
+                            baseRule = CStr(showSettings(tmpPath2))
+                            If baseRule = "1st level" Then
+                                effRule2 = "nothing"
+                            Else
+                                effRule2 = baseRule
+                            End If
+                            Exit Do
+                        End If
+
+                        p3 = InStrRev(tmpPath2, "\")
+                        If p3 > 0 Then
+                            tmpPath2 = Left$(tmpPath2, p3 - 1)
+                        Else
+                            Exit Do
+                        End If
+                    Loop
+
+                    ' If nothing found in ancestors, implicit root rule = "1st level"
+                    If Len(effRule2) = 0 Then effRule2 = "1st level"
+
+                    Select Case effRule2
+                        Case "all"
+                            r.Range.Cells(1, colShow).Value = "All"
+                        Case "nothing"
+                            r.Range.Cells(1, colShow).Value = "Nothing"
+                        Case "1st level"
+                            r.Range.Cells(1, colShow).Value = "1st Level"
+                    End Select
+                End If
+            End If
+        Next r
+    End If
+
+    Debug.Print "EXIT 10) Fill blank Show?, secs=" & Format$(Timer - tBlock, "0.000")
+
+    '— 11) hyperlinks —
+    tBlock = Timer
+    Debug.Print "ENTER 11) Hyperlinks at " & Format$(Now, "hh:nn:ss")
+
     If DO_HYPERLINKS And colLink > 0 And Not loFiles.DataBodyRange Is Nothing Then
         ApplyHyperlinksOnLinkColumnFast loFiles, colLink
     End If
 
-    '— sort —
+    Debug.Print "EXIT 11) Hyperlinks, secs=" & Format$(Timer - tBlock, "0.000")
+
+    '— 12) sort —
+    tBlock = Timer
+    Debug.Print "ENTER 12) Sort at " & Format$(Now, "hh:nn:ss")
+
     If DO_SORT Then
         With loFiles.Sort
             .SortFields.Clear
@@ -452,36 +618,44 @@ Public Sub FolderScan()
         End With
     End If
 
-    '— paint missing (Excel \ FS) —  [Lap "Any row not present on disk becomes Yellow"]
+    Debug.Print "EXIT 12) Sort, secs=" & Format$(Timer - tBlock, "0.000")
+
+    '— 13) paint missing (Excel rows not in allowed FS set) —
+    tBlock = Timer
+    Debug.Print "ENTER 13) Paint missing (yellow) at " & Format$(Now, "hh:nn:ss")
+
     If DO_PAINT_MISSING Then
-        Dim currentRows As Object: Set currentRows = CreateObject("Scripting.Dictionary")
+        Dim missRanges As New Collection
+        Dim rngUnion As Range
         Dim rk As String
+
         For Each r In loFiles.ListRows
-            rk = CStr(r.Range.Cells(1, colRelPath).Value)
+            rk = NormalizePath(CStr(r.Range.Cells(1, colRelPath).Value))
             If Len(rk) > 0 Then
-                If currentRows.Exists(rk) Then currentRows.Remove rk
-                currentRows.Add rk, r
+                If Not fsRelSet.Exists(rk) Then
+                    missRanges.Add r.Range
+                End If
             End If
         Next r
 
-        If toMissing.Count > 0 Then
-            Dim missRanges As New Collection, rr As Variant, rngUnion As Range
-            For Each rr In toMissing.keys
-                rk = CStr(rr)
-                If currentRows.Exists(rk) Then missRanges.Add currentRows(rk).Range
-            Next rr
-
-            Set rngUnion = UnionChunked(missRanges, 60)
-            If Not rngUnion Is Nothing Then rngUnion.Interior.Color = vbYellow
-        End If
+        Set rngUnion = UnionChunked(missRanges, 60)
+        If Not rngUnion Is Nothing Then rngUnion.Interior.Color = vbYellow
     End If
 
-    '— finalize —
+    Debug.Print "EXIT 13) Paint missing, secs=" & Format$(Timer - tBlock, "0.000")
+
+    '— 14) finalize —
+    tBlock = Timer
+    Debug.Print "ENTER 14) Finalize at " & Format$(Now, "hh:nn:ss")
+
     ActiveWorkbook.Worksheets("Cover").Range("cUpdateDate").Value = Date
     If DO_UPDATE_KW Then UpdateKeywordsTable
     If DO_REFRESH_ALL Then ActiveWorkbook.RefreshAll
 
     MsgBox "tbFiles synchronized.", vbInformation
+
+    Debug.Print "EXIT 14) Finalize, secs=" & Format$(Timer - tBlock, "0.000")
+    Debug.Print "FolderScan - END, total secs=" & Format$(Timer - tTotal, "0.000")
 
 CleanUp:
     Application.EnableEvents = True
@@ -495,12 +669,12 @@ CleanFail:
     Else
         MsgBox "FolderScan failed: " & Err.Number & " — " & Err.Description, vbCritical
     End If
+    Debug.Print "FolderScan - ERROR " & Err.Number & " after " & Format$(Timer - tTotal, "0.000") & " secs"
     Resume CleanUp
 End Sub
 
 
 ' --- lightweight timing ---
-
 Public Sub Lap(ByVal label As String)
 Static t0 As Double
     If t0 = 0 Then
@@ -510,32 +684,70 @@ Static t0 As Double
     Debug.Print "Time " & Format(Timer - t0, "0.000") & "s — " & label
 End Sub
 
-' Fast, idempotent hyperlinks (NEW)
+' Fast, idempotent hyperlinks, with "no link" ? Error? = "Invalid shortcut link" if blank
 Private Sub ApplyHyperlinksOnLinkColumnFast(ByVal lo As ListObject, ByVal colLink As Long)
     On Error GoTo EH
     If lo Is Nothing Then Exit Sub
     If lo.DataBodyRange Is Nothing Then Exit Sub
     If colLink <= 0 Then Exit Sub
 
-    Dim cell As Range, url As String
+    Dim colError As Long
+    Dim hasErrorCol As Boolean
+    Dim deltaCol As Long
+
+    Dim cell As Range
+    Dim url As String
+    Dim errCell As Range
+
+    ' Detect "Error?" column if present
+    hasErrorCol = ColumnExists(lo, "Error?")
+    If hasErrorCol Then
+        colError = lo.ListColumns("Error?").Index
+        deltaCol = colError - colLink   ' offset from Link column to Error? column
+    Else
+        deltaCol = 0
+    End If
+
     Application.DisplayAlerts = False
+
     For Each cell In lo.DataBodyRange.Columns(colLink).Cells
         url = CStr(cell.Value)
-        If Len(url) > 0 Then
+
+        ' --- Special handling for "no link" ---
+        If LCase$(Trim$(url)) = "no link" Then
+            ' Ensure there is no hyperlink
+            If cell.Hyperlinks.Count > 0 Then cell.Hyperlinks.Delete
+
+            ' If we have an Error? column and it is blank, set our message
+            If hasErrorCol Then
+                Set errCell = cell.Offset(0, deltaCol)
+                If Len(Trim$(CStr(errCell.Value))) = 0 Then
+                    errCell.Value = "Invalid shortcut link"
+                End If
+            End If
+
+        ' --- Normal non-empty URLs: maintain hyperlink ---
+        ElseIf Len(url) > 0 Then
             If cell.Hyperlinks.Count = 0 Or cell.Hyperlinks(1).Address <> url Then
                 If cell.Hyperlinks.Count > 0 Then cell.Hyperlinks.Delete
                 cell.Worksheet.Hyperlinks.Add Anchor:=cell, Address:=url, TextToDisplay:=url
             End If
-        ElseIf cell.Hyperlinks.Count > 0 Then
-            cell.Hyperlinks.Delete
+
+        ' --- Blank link cell: ensure no hyperlink ---
+        Else
+            If cell.Hyperlinks.Count > 0 Then cell.Hyperlinks.Delete
         End If
+
         If (cell.Row Mod 400) = 0 Then DoEvents
     Next cell
+
     Application.DisplayAlerts = True
     Exit Sub
+
 EH:
     Application.DisplayAlerts = True
 End Sub
+
 
 ' Chunk-safe Union to avoid O(n^2) unions (NEW)
 Private Function UnionChunked(ByVal rngs As Collection, Optional ByVal chunkSize As Long = 60) As Range
@@ -1310,7 +1522,7 @@ Public Sub ScanFoldersAndFiles(ByVal rootFolderPath As String, ByRef containerOu
     ' reset visited set for this run
     Set visited = CreateObject("Scripting.Dictionary")
 
-    Dim rootFolder As Scripting.Folder
+    Dim rootFolder As Scripting.folder
     Set rootFolder = fso.GetFolder(rootFolderPath)
 
     ' Skip root if hidden/system
@@ -1321,17 +1533,17 @@ End Sub
 
 ' Add re-visit guard at the very start (CHANGED)
 Private Sub RecursiveFolderScan( _
-        ByVal Folder As Scripting.Folder, _
+        ByVal folder As Scripting.folder, _
         ByRef containerOut As MyContainer, _
         ByVal theRoot As String, _
         ByVal theLevel As Integer)
 
     If visited Is Nothing Then Set visited = CreateObject("Scripting.Dictionary")
-    If visited.Exists(Folder.Path) Then Exit Sub
-    visited.Add Folder.Path, True
+    If visited.Exists(folder.Path) Then Exit Sub
+    visited.Add folder.Path, True
 
     Dim fileContainer   As MyContainer
-    Dim subfolder       As Scripting.Folder
+    Dim subfolder       As Scripting.folder
     Dim file            As Scripting.file
     Dim aDescriptor     As FileDescriptor
     Dim relPath         As String
@@ -1342,10 +1554,10 @@ Private Sub RecursiveFolderScan( _
     Set fileContainer = New MyContainer
 
     ' Skip hidden/system
-    If (Folder.Attributes And 6) <> 0 Then Exit Sub
+    If (folder.Attributes And 6) <> 0 Then Exit Sub
 
     '--- Process subfolders ---
-    For Each subfolder In Folder.SubFolders
+    For Each subfolder In folder.SubFolders
         If (subfolder.Attributes And 6) = 0 Then
             Set aDescriptor = New FileDescriptor
 
@@ -1355,7 +1567,7 @@ Private Sub RecursiveFolderScan( _
 
             If depth >= 0 Then aDescriptor.Domain = parts(0) Else aDescriptor.Domain = ""
             If depth >= 1 Then aDescriptor.Category = parts(1) Else aDescriptor.Category = ""
-            If depth >= 2 Then aDescriptor.Folder = parts(2) Else aDescriptor.Folder = ""
+            If depth >= 2 Then aDescriptor.folder = parts(2) Else aDescriptor.folder = ""
 
             Select Case depth
               Case 0: aDescriptor.ObjectType = "Domain"
@@ -1369,7 +1581,7 @@ Private Sub RecursiveFolderScan( _
             basePath = theRoot
             If aDescriptor.Domain <> "" Then basePath = basePath & "\" & aDescriptor.Domain
             If aDescriptor.Category <> "" Then basePath = basePath & "\" & aDescriptor.Category
-            If aDescriptor.Folder <> "" Then basePath = basePath & "\" & aDescriptor.Folder
+            If aDescriptor.folder <> "" Then basePath = basePath & "\" & aDescriptor.folder
 
             aDescriptor.objectName = Replace(Mid$(subfolder.Path, Len(basePath) + 1), "\", "/")
             aDescriptor.RelativePath = relPath
@@ -1381,7 +1593,7 @@ Private Sub RecursiveFolderScan( _
     Next
 
     '--- Process files ---
-    For Each file In Folder.Files
+    For Each file In folder.Files
         If (file.Attributes And 6) = 0 Then
             Set aDescriptor = New FileDescriptor
 
@@ -1391,7 +1603,7 @@ Private Sub RecursiveFolderScan( _
 
             If depth >= 1 Then aDescriptor.Domain = parts(0) Else aDescriptor.Domain = ""
             If depth >= 2 Then aDescriptor.Category = parts(1) Else aDescriptor.Category = ""
-            If depth >= 3 Then aDescriptor.Folder = parts(2) Else aDescriptor.Folder = ""
+            If depth >= 3 Then aDescriptor.folder = parts(2) Else aDescriptor.folder = ""
 
             aDescriptor.ObjectType = GetFileFormat(file.Name)
             aDescriptor.fileName = parts(depth)
@@ -1399,19 +1611,58 @@ Private Sub RecursiveFolderScan( _
             basePath = theRoot
             If aDescriptor.Domain <> "" Then basePath = basePath & "\" & aDescriptor.Domain
             If aDescriptor.Category <> "" Then basePath = basePath & "\" & aDescriptor.Category
-            If aDescriptor.Folder <> "" Then basePath = basePath & "\" & aDescriptor.Folder
+            If aDescriptor.folder <> "" Then basePath = basePath & "\" & aDescriptor.folder
 
             aDescriptor.objectName = Replace(Mid$(file.Path, Len(basePath) + 1), "\", "/")
             aDescriptor.RelativePath = relPath
 
             fileContainer.Add aDescriptor, file.Name
         End If
-        If (Folder.Files.Count Mod 400) = 0 Then DoEvents
+        If (folder.Files.Count Mod 400) = 0 Then DoEvents
     Next
 
-    containerOut.Add fileContainer, Folder.Path
+    containerOut.Add fileContainer, folder.Path
 End Sub
 
+'=========================================================
+' ScanFilesystemWithShow
+'   Entry point from FolderScan
+'   - rootPath: tbConfig[Local Root]
+'   - domainName: tbConfig[Domain name]
+'   - showSettings: Dictionary(RelativePath -> "all"/"nothing"/"1st level")
+'   - allowed: Dictionary(RelativePath -> FileDescriptor)
+'=========================================================
+Private Sub ScanFilesystemWithShow( _
+    ByVal rootPath As String, _
+    ByVal domainName As String, _
+    ByVal showSettings As Object, _
+    ByVal allowed As Object)
+
+    Dim fso As Scripting.FileSystemObject
+    Dim rootFolder As Scripting.folder
+    Dim t0 As Double
+
+    scanSteps = 0        ' reset step counter each run
+    Debug.Print String(60, "-")
+    Debug.Print "ScanFS ENTER " & Now & " root=" & rootPath
+    t0 = Timer
+
+    Set fso = New Scripting.FileSystemObject
+    If Not fso.FolderExists(rootPath) Then
+        Err.Raise vbObjectError + 100, , "Folder not found: " & rootPath
+    End If
+
+    Set rootFolder = fso.GetFolder(rootPath)
+
+    ' reset visited guard for this run
+    Set visited = CreateObject("Scripting.Dictionary")
+
+    ' implicit root rule = "1st level", start at depth 0
+    RecursiveScanFolderWithShow rootFolder, "", "1st level", showSettings, domainName, allowed
+
+    Debug.Print "ScanFS EXIT  items=" & allowed.Count & _
+                "  secs=" & Format$(Timer - t0, "0.0")
+End Sub
 
 Function GetFileFormat(fileName As String) As String
     Dim ext As String
@@ -1440,6 +1691,597 @@ Function GetFileFormat(fileName As String) As String
             GetFileFormat = UCase(Left(ext, 1)) & LCase(Mid(ext, 2))
             GetFileFormat = LCase(ext)
     End Select
+End Function
+
+
+
+
+' Recursive scan with Show? inheritance.
+' parentRule is the effective Show? rule inherited from the parent folder
+' ("" at the very top ? implicit "1st level").
+Private Sub RecurseFolderWithShow_TRASHNOTUSED( _
+        ByVal folder As Scripting.folder, _
+        ByVal rootPath As String, _
+        ByVal relPath As String, _
+        ByVal parentRule As String, _
+        ByVal domainName As String, _
+        ByVal showSettings As Object, _
+        ByRef allowed As Object)
+
+    Dim myRule As String
+    Dim explicitRule As String
+    Dim key As String
+    Dim file As Scripting.file
+    Dim subfolder As Scripting.folder
+    Dim childRel As String
+    Dim desc As FileDescriptor
+    Dim parts() As String
+    Dim depth As Long
+
+    If visited Is Nothing Then Set visited = CreateObject("Scripting.Dictionary")
+    If visited.Exists(folder.Path) Then Exit Sub
+    visited.Add folder.Path, True
+
+    ' Skip hidden/system
+    If (folder.Attributes And 6) <> 0 Then Exit Sub
+
+    key = relPath
+
+    ' Determine effective rule for THIS folder
+    If LCase$(parentRule) = "nothing" Then
+        ' Once a parent is Nothing, whole subtree is effectively Nothing
+        myRule = "nothing"
+    Else
+        If showSettings Is Nothing Then
+            explicitRule = ""
+        ElseIf showSettings.Exists(key) Then
+            explicitRule = LCase$(CStr(showSettings(key)))
+        Else
+            explicitRule = ""
+        End If
+
+        If Len(explicitRule) > 0 Then
+            Select Case explicitRule
+                Case "all", "nothing", "1st level"
+                    myRule = explicitRule
+                Case Else
+                    myRule = "nothing"
+            End Select
+        Else
+            ' inherit from parent, or implicit root rule
+            If Len(parentRule) > 0 Then
+                myRule = LCase$(parentRule)
+            Else
+                myRule = "1st level"
+            End If
+        End If
+    End If
+
+    ' Normalize for safety
+    Select Case myRule
+        Case "all", "nothing", "1st level"
+        Case Else
+            myRule = "nothing"
+    End Select
+
+    ' Create descriptor for this folder and add to allowed
+    Set desc = New FileDescriptor
+    desc.Domain = domainName
+    desc.RelativePath = relPath
+    desc.fileName = folder.Name
+    desc.objectName = folder.Name
+
+    If Len(relPath) > 0 Then
+        parts = Split(relPath, "\")
+        depth = UBound(parts)
+    Else
+        depth = -1
+    End If
+
+    If depth >= 0 Then desc.Category = parts(0) Else desc.Category = ""
+    If depth >= 1 Then desc.folder = parts(1) Else desc.folder = ""
+
+    Select Case depth
+        Case 0: desc.ObjectType = "Category"
+        Case 1: desc.ObjectType = "Folder"
+        Case Else: desc.ObjectType = "Subfolder"
+    End Select
+
+    If allowed.Exists(relPath) Then allowed.Remove relPath
+    allowed.Add relPath, desc
+
+    ' Decide how deep to go based on myRule
+    Select Case myRule
+        Case "nothing"
+            ' Folder row itself is visible, but no children
+            Exit Sub
+
+        Case "1st level"
+            ' Folder row, plus immediate children only; no grandchildren
+
+            ' Files directly inside this folder
+            For Each file In folder.Files
+                If (file.Attributes And 6) = 0 Then
+                    Set desc = CreateFileDescriptorSimple(file, rootPath, domainName)
+                    If Not allowed.Exists(desc.RelativePath) Then
+                        allowed.Add desc.RelativePath, desc
+                    End If
+                End If
+                If (folder.Files.Count Mod 400) = 0 Then DoEvents
+            Next file
+
+            ' Subfolders directly inside this folder – show them as rows,
+            ' but do not recurse into their children.
+            For Each subfolder In folder.SubFolders
+                If (subfolder.Attributes And 6) = 0 Then
+                    childRel = Mid$(subfolder.Path, Len(rootPath) + 1)
+                    ' Build descriptor for the child folder
+                    Set desc = New FileDescriptor
+                    desc.Domain = domainName
+                    desc.RelativePath = childRel
+                    desc.fileName = subfolder.Name
+                    desc.objectName = subfolder.Name
+
+                    If Len(childRel) > 0 Then
+                        parts = Split(childRel, "\")
+                        depth = UBound(parts)
+                    Else
+                        depth = -1
+                    End If
+
+                    If depth >= 0 Then desc.Category = parts(0) Else desc.Category = ""
+                    If depth >= 1 Then desc.folder = parts(1) Else desc.folder = ""
+
+                    Select Case depth
+                        Case 0: desc.ObjectType = "Category"
+                        Case 1: desc.ObjectType = "Folder"
+                        Case Else: desc.ObjectType = "Subfolder"
+                    End Select
+
+                    If allowed.Exists(childRel) Then allowed.Remove childRel
+                    allowed.Add childRel, desc
+                End If
+                If (subfolder.Files.Count Mod 200) = 0 Then DoEvents
+            Next subfolder
+
+        Case Else  ' "all"
+            ' Folder row + full recursion
+
+            ' Files
+            For Each file In folder.Files
+                If (file.Attributes And 6) = 0 Then
+                    Set desc = CreateFileDescriptorSimple(file, rootPath, domainName)
+                    If Not allowed.Exists(desc.RelativePath) Then
+                        allowed.Add desc.RelativePath, desc
+                    End If
+                End If
+                If (folder.Files.Count Mod 400) = 0 Then DoEvents
+            Next file
+
+            ' Subfolders – recurse normally
+            For Each subfolder In folder.SubFolders
+                If (subfolder.Attributes And 6) = 0 Then
+                    childRel = Mid$(subfolder.Path, Len(rootPath) + 1)
+                    RecurseFolderWithShow_TRASHNOTUSED subfolder, rootPath, childRel, myRule, domainName, showSettings, allowed
+                End If
+                If (subfolder.Files.Count Mod 200) = 0 Then DoEvents
+            Next subfolder
+    End Select
+End Sub
+
+' Build a FileDescriptor for a file, without resolving shortcuts.
+' Shortcut Target/Link is resolved later only for new/changed rows.
+Private Function CreateFileDescriptorSimple( _
+        ByVal fileObj As Scripting.file, _
+        ByVal rootPath As String, _
+        ByVal domainName As String) As FileDescriptor
+
+    Dim d As FileDescriptor
+    Dim relPath As String
+    Dim parts() As String
+    Dim depth As Long
+    Dim extLower As String
+    Dim t As String
+    Dim dotPos As Long
+
+    Set d = New FileDescriptor
+
+    relPath = Mid$(fileObj.Path, Len(rootPath) + 1)
+    d.RelativePath = relPath
+    d.Domain = domainName
+
+    If Len(relPath) > 0 Then
+        parts = Split(relPath, "\")
+        depth = UBound(parts)
+    Else
+        depth = -1
+    End If
+
+    ' For files: first segment is Category, second is Folder
+    If depth >= 1 Then d.Category = parts(0) Else d.Category = ""
+    If depth >= 2 Then d.folder = parts(1) Else d.folder = ""
+
+    d.fileName = fileObj.Name
+    d.objectName = fileObj.Name
+
+    ' Default ObjectType from extension
+    d.ObjectType = GetFileFormat(fileObj.Name)
+
+    ' Special handling for shortcuts: type from "(Hint)" in name, but NO link resolution here
+    dotPos = InStrRev(fileObj.Name, ".")
+    If dotPos > 0 Then
+        extLower = LCase$(Mid$(fileObj.Name, dotPos + 1))
+        If extLower = "url" Or extLower = "lnk" Then
+            t = DeriveShortcutTypeFromName(fileObj.Name)
+            If Len(t) > 0 Then
+                d.ObjectType = t           ' preserve hint case, e.g. "SharePoint Video"
+            Else
+                d.ObjectType = "shortcut"
+            End If
+            ' d.Link stays blank; will be filled only for new/blank rows in FolderScan
+        End If
+    End If
+
+    Set CreateFileDescriptorSimple = d
+End Function
+
+
+
+
+'---------------------------------------------------------
+' Helper: add or replace a FileDescriptor in `allowed`
+'---------------------------------------------------------
+Private Sub AddOrReplaceAllowed(ByVal dict As Object, _
+                                ByVal key As String, _
+                                ByVal fd As FileDescriptor)
+    If dict.Exists(key) Then
+        Set dict(key) = fd
+    Else
+        dict.Add key, fd
+    End If
+End Sub
+
+' This is weird, but I had folders containing character 8203 in its name (no idea how I got this)
+Private Function NormalizePath(ByVal s As String) As String
+    If Len(s) = 0 Then
+        NormalizePath = ""
+        Exit Function
+    End If
+
+    ' ZERO WIDTH SPACE U+200B
+    s = Replace$(s, ChrW(8203), "")
+
+    ' Optional extras, if you ever hit them:
+    ' BOM U+FEFF
+    s = Replace$(s, ChrW(65279), "")
+    ' Non-breaking space -> normal space
+    s = Replace$(s, ChrW(160), " ")
+
+    NormalizePath = s
+End Function
+
+'---------------------------------------------------------
+' Recursive folder scan with Show? semantics
+'   - folder: current FSO folder
+'   - relPath: RelativePath from LocalRoot ("" for root)
+'   - inheritedRule: "all" / "1st level" / "nothing"
+'   - showSettings: Dict(RelPath -> explicit rule)
+'   - allowed: Dict(RelPath -> FileDescriptor)
+'
+' Rules:
+'   * "all"       ? folder + ALL descendants
+'   * "nothing"   ? folder row only if explicit, no descendants
+'   * "1st level" ? folder + immediate children (files+folders);
+'                    recurse into a child folder ONLY if it has
+'                    its own explicit Show? rule
+'
+' Visited guard:
+'   Avoid infinite loops through junctions / reparse points by
+'   remembering each physical Folder.Path once.
+'---------------------------------------------------------
+Private Sub RecursiveScanFolderWithShow( _
+    ByVal folder As Scripting.folder, _
+    ByVal relPath As String, _
+    ByVal inheritedRule As String, _
+    ByVal showSettings As Object, _
+    ByVal domainName As String, _
+    ByVal allowed As Object)
+
+    'Const SCAN_MAX_STEPS As Long = 500000
+    'Const MAX_SCAN_DEPTH As Long = 40
+
+    'Static scanSteps As Long
+
+    Dim effRule As String
+    Dim hasExplicit As Boolean
+    Dim fd As FileDescriptor
+    Dim subfolder As Scripting.folder
+    Dim file As Scripting.file
+    Dim childRel As String
+    Dim iCount As Long
+    Dim childRule As String
+    Dim depth As Long
+
+    '---------- visited guard (physical path) ----------
+    If visited Is Nothing Then Set visited = CreateObject("Scripting.Dictionary")
+    If visited.Exists(folder.Path) Then Exit Sub
+    visited.Add folder.Path, True
+
+    ' Normalize relPath so dictionary keys are clean and match Excel
+    relPath = NormalizePath(relPath)
+
+    ' Root call: reset step counter for each new full scan
+    If Len(relPath) = 0 Then
+        scanSteps = 0
+    End If
+
+    ' Compute depth from relPath (number of segments)
+    If Len(relPath) = 0 Then
+        depth = 0
+    Else
+        depth = UBound(Split(relPath, "\")) + 1
+    End If
+
+    '----- step guard / debug -----
+    scanSteps = scanSteps + 1
+    If (scanSteps Mod 1000) = 0 Then
+        Debug.Print "RS step"; scanSteps; " rel='"; relPath; "' rule='"; inheritedRule; "'"
+    End If
+    If scanSteps > SCAN_MAX_STEPS Then
+        Err.Raise vbObjectError + 999, , _
+            "RecursiveScanFolderWithShow aborted after " & scanSteps & _
+            " steps at folder: " & folder.Path & " relPath=" & relPath
+    End If
+
+    '----- hard depth guard -----
+    If depth > MAX_SCAN_DEPTH Then
+        Debug.Print "Guard: MAX_SCAN_DEPTH reached at relPath=" & relPath & _
+                    " (depth=" & depth & ")"
+        Exit Sub
+    End If
+
+    ' Optional: manual breakpoint for specific paths
+    'If relPath = "03 Sourcebook" Or relPath = "03 Sourcebook\002 Adobe XMP Specification" Then
+    '    Debug.Print ">>> BREAK in RecursiveScanFolderWithShow, relPath=" & relPath & _
+    '                "  inheritedRule=" & inheritedRule
+    '    Stop     ' VB6-style breakpoint
+    '    Debug.Print "force stop"
+    'End If
+
+    '----- Determine effective rule for THIS folder -----
+    effRule = inheritedRule
+    hasExplicit = False
+
+    ' Show? only lives on folder rows, keyed by RelativePath
+    If Len(relPath) > 0 Then
+        If Not showSettings Is Nothing Then
+            If showSettings.Exists(relPath) Then
+                effRule = CStr(showSettings(relPath))      ' "all" / "nothing" / "1st level"
+                hasExplicit = True
+            End If
+        End If
+    End If
+
+    ' Normalize effRule defensively
+    Select Case LCase$(effRule)
+        Case "all", "nothing", "1st level"
+            effRule = LCase$(effRule)
+        Case Else
+            ' If something weird arrives, treat as "nothing"
+            effRule = "nothing"
+    End Select
+
+    '----- Add folder descriptor (except for root relPath="") -----
+    If Len(relPath) > 0 Then
+        ' For Show? = Nothing:
+        '   - If rule is explicit here, include this folder row;
+        '   - If it is inherited, keep this branch invisible
+        '     (existing Excel rows will later go yellow).
+        If effRule = "nothing" And Not hasExplicit Then
+            ' inherited Nothing ? do NOT add this folder row
+        Else
+            Set fd = BuildFolderDescriptor(folder, relPath, domainName)
+            AddOrReplaceAllowed allowed, relPath, fd
+        End If
+    End If
+
+    ' If effective rule is "nothing": do not go deeper at all
+    If effRule = "nothing" Then Exit Sub
+
+    '=====================================================
+    ' Rule "all" ? folder + ALL descendants
+    '=====================================================
+    If effRule = "all" Then
+        '--- files in this folder ---
+        iCount = 0
+        For Each file In folder.Files
+            If (file.Attributes And 6) = 0 Then   ' skip hidden/system
+                If Len(relPath) = 0 Then
+                    childRel = file.Name
+                Else
+                    childRel = relPath & "\" & file.Name
+                End If
+
+                childRel = NormalizePath(childRel)
+
+                Set fd = BuildFileDescriptor(file, childRel, domainName)
+                AddOrReplaceAllowed allowed, childRel, fd
+            End If
+
+            iCount = iCount + 1
+            If (iCount Mod 200) = 0 Then DoEvents
+        Next file
+
+        '--- subfolders (recurse) ---
+        iCount = 0
+        For Each subfolder In folder.SubFolders
+            If (subfolder.Attributes And 6) = 0 Then  ' skip hidden/system
+                If Len(relPath) = 0 Then
+                    childRel = subfolder.Name
+                Else
+                    childRel = relPath & "\" & subfolder.Name
+                End If
+
+                childRel = NormalizePath(childRel)
+
+                ' inheritedRule "all" – explicit rules (if any) will override inside
+                RecursiveScanFolderWithShow subfolder, childRel, "all", showSettings, domainName, allowed
+            End If
+
+            iCount = iCount + 1
+            If (iCount Mod 100) = 0 Then DoEvents
+        Next subfolder
+
+        Exit Sub
+    End If
+
+    '=====================================================
+    ' Rule "1st level"
+    '   - Show this folder and its immediate children
+    '   - Recurse ONLY into child folders with explicit Show? rule
+    '=====================================================
+    If effRule = "1st level" Then
+        '--- files directly inside this folder ---
+        iCount = 0
+        For Each file In folder.Files
+            If (file.Attributes And 6) = 0 Then
+                If Len(relPath) = 0 Then
+                    childRel = file.Name
+                Else
+                    childRel = relPath & "\" & file.Name
+                End If
+
+                childRel = NormalizePath(childRel)
+
+                Set fd = BuildFileDescriptor(file, childRel, domainName)
+                AddOrReplaceAllowed allowed, childRel, fd
+            End If
+
+            iCount = iCount + 1
+            If (iCount Mod 200) = 0 Then DoEvents
+        Next file
+
+        '--- subfolders directly inside this folder ---
+        iCount = 0
+        For Each subfolder In folder.SubFolders
+            If (subfolder.Attributes And 6) = 0 Then
+                If Len(relPath) = 0 Then
+                    childRel = subfolder.Name
+                Else
+                    childRel = relPath & "\" & subfolder.Name
+                End If
+
+                childRel = NormalizePath(childRel)
+
+                ' Always show the immediate child folder row
+                Set fd = BuildFolderDescriptor(subfolder, childRel, domainName)
+                AddOrReplaceAllowed allowed, childRel, fd
+
+                ' If this child has its OWN explicit Show? rule,
+                ' recurse into it so that that rule (all / 1st level / nothing)
+                ' is applied independently of the parent 1st level.
+                If Not showSettings Is Nothing Then
+                    If showSettings.Exists(childRel) Then
+                        childRule = CStr(showSettings(childRel))
+                        RecursiveScanFolderWithShow subfolder, childRel, childRule, showSettings, domainName, allowed
+                    End If
+                End If
+            End If
+
+            iCount = iCount + 1
+            If (iCount Mod 100) = 0 Then DoEvents
+        Next subfolder
+
+        Exit Sub
+    End If
+
+    '=====================================================
+    ' Any other rule (should not happen – already normalized)
+    ' Treat as "nothing" from here down.
+    '=====================================================
+    ' Do not descend.
+End Sub
+
+
+
+
+'---------------------------------------------------------
+' Build FileDescriptor for a FOLDER
+'   relPath: "Cat", "Cat\Folder", "Cat\Folder\Sub1", ...
+'---------------------------------------------------------
+Private Function BuildFolderDescriptor( _
+    ByVal folder As Scripting.folder, _
+    ByVal relPath As String, _
+    ByVal domainName As String) As FileDescriptor
+
+    Dim d As FileDescriptor
+    Dim parts() As String
+    Dim n As Long
+
+    Set d = New FileDescriptor
+
+    d.Domain = domainName
+    d.RelativePath = relPath
+    d.fileName = folder.Name
+    d.objectName = folder.Name   ' not used in Excel, but OK
+
+    If Len(relPath) > 0 Then
+        parts = Split(relPath, "\")
+        n = UBound(parts)
+
+        If n >= 0 Then d.Category = parts(0) Else d.Category = ""
+        If n >= 1 Then d.folder = parts(1) Else d.folder = ""
+
+        Select Case n
+            Case 0: d.ObjectType = "Category"
+            Case 1: d.ObjectType = "Folder"
+            Case Else: d.ObjectType = "Subfolder"
+        End Select
+    Else
+        ' Root should never be stored, but set something safe
+        d.Category = ""
+        d.folder = ""
+        d.ObjectType = "Folder"
+    End If
+
+    Set BuildFolderDescriptor = d
+End Function
+
+'---------------------------------------------------------
+' Build FileDescriptor for a FILE
+'   relPath: "Cat\File.ext", "Cat\Folder\File.ext", ...
+'---------------------------------------------------------
+Private Function BuildFileDescriptor( _
+    ByVal file As Scripting.file, _
+    ByVal relPath As String, _
+    ByVal domainName As String) As FileDescriptor
+
+    Dim d As FileDescriptor
+    Dim parts() As String
+    Dim n As Long
+
+    Set d = New FileDescriptor
+
+    d.Domain = domainName
+    d.RelativePath = relPath
+    d.fileName = file.Name
+    d.objectName = file.Name   ' We only persist fileName into tbFiles
+
+    If Len(relPath) > 0 Then
+        parts = Split(relPath, "\")
+        n = UBound(parts)
+
+        ' For files: Category = first segment, Folder = second
+        If n >= 1 Then d.Category = parts(0) Else d.Category = ""
+        If n >= 2 Then d.folder = parts(1) Else d.folder = ""
+    Else
+        d.Category = ""
+        d.folder = ""
+    End If
+
+    d.ObjectType = GetFileFormat(file.Name)
+
+    Set BuildFileDescriptor = d
 End Function
 
 
