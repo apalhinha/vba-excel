@@ -11,12 +11,13 @@ Option Explicit
 
 'File descriptor for use with FolderScan
 
+Public Repository As String     ' auto, comes from tbConfig[Short Name]
 Public Domain As String         ' auto, the first folder after LocalRoot
 Public Category As String       ' auto, the second folder after LocalRoot
-Public Folder As String         ' auto, the third folder after LocalRoot
+Public folder As String         ' auto, the third folder after LocalRoot
 Public ObjectType As String     ' auto, eg. 'PowerPoint'
 Public fileName As String       ' auto, as seen from Parent Folder. Example 'Conference_Template.pptx' or 'Subfolder name'
-Public ObjectName As String     ' auto, pathname after Folder. Example 'Conference.pptx' or 'Subfolder name' or 'Subfolder/Inner/Somefile.pptx'
+Public objectName As String     ' auto, pathname after Folder. Example 'Conference.pptx' or 'Subfolder name' or 'Subfolder/Inner/Somefile.pptx'
 Public RelativePath As String   ' auto, path and filename staring from the LocalRoot folder. Eg., "Admin\2503 Human Resources\Trainning\Some file.xlsx"
 
 ' These fields are maintained in Excel and we will addressthem later:
